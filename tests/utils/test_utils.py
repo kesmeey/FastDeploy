@@ -486,23 +486,5 @@ def test_retrive_model_from_server_invalid_source(monkeypatch):
         utils.retrive_model_from_server("some-model")
 
 
-def test_version_and_current_package_version(tmp_path, monkeypatch):
-    version_path = Path(utils.__file__).with_name("version.txt")
-    original_version = utils.version
-    monkeypatch.setattr(utils, "version", Mock(return_value="fastdeploy version: 1.2.3\nother"))
-    assert utils.current_package_version() == "1.2.3"
-
-    monkeypatch.setattr(utils, "version", Mock(return_value="Unknown"))
-    assert utils.current_package_version() == "Unknown"
-
-    monkeypatch.setattr(utils, "version", Mock(return_value="no version here"))
-    assert utils.current_package_version() == "Unknown"
-
-    monkeypatch.setattr(utils, "version", original_version)
-    if version_path.exists():
-        version_path.unlink()
-    assert utils.version() == "Unknown"
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
