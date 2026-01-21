@@ -505,4 +505,4 @@ def test_version_and_current_package_version(tmp_path, monkeypatch):
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    pytest.main([__file__, "-v"])
