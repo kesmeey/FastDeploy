@@ -21,6 +21,7 @@ import paddle
 
 from fastdeploy import envs
 from fastdeploy.engine.request import Request
+from fastdeploy.inter_communicator.engine_worker_queue import EngineWorkerQueue
 from fastdeploy.utils import to_numpy, to_tensor
 
 
@@ -30,6 +31,22 @@ class DummyTask:
 
 
 class TestEngineWorkerQueue(unittest.TestCase):
+    def _create_queue_pair(self, address=("127.0.0.1", 0), num_client=1):
+        server = EngineWorkerQueue(
+            address=address,
+            authkey=b"secret_key",
+            is_server=True,
+            num_client=num_client,
+        )
+        client = EngineWorkerQueue(
+            address=server.address,
+            authkey=b"secret_key",
+            is_server=False,
+            num_client=num_client,
+            client_id=0,
+        )
+        return server, client
+
     def test_to_tensor_success(self):
         envs.FD_ENABLE_MAX_PREFILL = 1
         # 模拟 numpy 数组输入（使用 paddle 转 numpy）
@@ -59,19 +76,15 @@ class TestEngineWorkerQueue(unittest.TestCase):
         tasks = [task]
 
         # 不应抛异常
-        try:
-            to_tensor(tasks)
-        except Exception as e:
-            self.fail(f"Unexpected exception raised: {e}")
+        to_tensor(tasks)
+        self.assertFalse(hasattr(task, "multimodal_inputs"))
 
     def test_to_tensor_exception_handling(self):
         bad_task = DummyTask(images="not an array")
         bad_tasks = [bad_task]
 
-        try:
-            to_tensor(bad_tasks)
-        except Exception as e:
-            self.fail(f"Exception should be handled internally, but got: {e}")
+        to_tensor(bad_tasks)
+        self.assertEqual(bad_task.multimodal_inputs["images"], "not an array")
 
     def test_to_numpy_success(self):
         envs.FD_ENABLE_MAX_PREFILL = 1
@@ -104,10 +117,8 @@ class TestEngineWorkerQueue(unittest.TestCase):
         tasks = [task]
 
         # 不应抛异常
-        try:
-            to_numpy(tasks)
-        except Exception as e:
-            self.fail(f"Unexpected exception raised: {e}")
+        to_numpy(tasks)
+        self.assertFalse(hasattr(task, "multimodal_inputs"))
 
     def test_to_numpy_non_tensor_input(self):
         envs.FD_ENABLE_MAX_PREFILL = 1
@@ -128,13 +139,12 @@ class TestEngineWorkerQueue(unittest.TestCase):
             def numpy(self):
                 raise RuntimeError("mock error")
 
-        bad_task = DummyTask(images=BadTensor())
+        bad_task = DummyTask(images=None)
+        bad_task.multimodal_inputs["image_features"] = [BadTensor()]
         bad_tasks = [bad_task]
 
-        try:
-            to_numpy(bad_tasks)
-        except Exception as e:
-            self.fail(f"Exception should be handled internally, but got: {e}")
+        to_numpy(bad_tasks)
+        self.assertIsInstance(bad_task.multimodal_inputs["image_features"][0], BadTensor)
 
     def test_features_info_to_tensor(self):
         envs.FD_ENABLE_MAX_PREFILL = 1
@@ -171,6 +181,102 @@ class TestEngineWorkerQueue(unittest.TestCase):
         self.assertEqual(len(task.multimodal_inputs["video_features"]), 2)
         self.assertIsInstance(task.multimodal_inputs["video_features"][0], np.ndarray)
         self.assertIsInstance(task.multimodal_inputs["video_features"][1], np.ndarray)
+
+    def test_engine_worker_queue_client_signals_and_port(self):
+        server, client = self._create_queue_pair()
+        try:
+            self.assertIsNone(client.exist_tasks_intra_signal)
+            self.assertFalse(client.exist_tasks())
+            client.set_exist_tasks(True)
+            self.assertTrue(client.exist_tasks())
+            client.set_exist_tasks(False)
+            self.assertFalse(client.exist_tasks())
+            with self.assertRaises(RuntimeError):
+                client.get_server_port()
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_connect_retry_failure(self):
+        class RefusingManager:
+            def connect(self):
+                raise ConnectionRefusedError("refuse")
+
+        queue = EngineWorkerQueue.__new__(EngineWorkerQueue)
+        queue.manager = RefusingManager()
+        queue.address = ("127.0.0.1", 12345)
+        with self.assertRaises(ConnectionError):
+            queue._connect_with_retry(max_retries=2, interval=0)
+
+    def test_engine_worker_queue_task_flow(self):
+        server, client = self._create_queue_pair()
+        original_flag = envs.FD_ENABLE_E2W_TENSOR_CONVERT
+        envs.FD_ENABLE_E2W_TENSOR_CONVERT = 1
+        try:
+            np_images = paddle.randn([1, 3, 8, 8]).numpy()
+            task = DummyTask(np_images)
+            tasks = [[task]]
+            client.put_tasks(tasks)
+
+            self.assertTrue(client.exist_tasks())
+            self.assertEqual(client.num_tasks(), 1)
+
+            got_tasks, all_read = client.get_tasks()
+            self.assertTrue(all_read)
+            self.assertFalse(client.exist_tasks())
+            self.assertIsInstance(got_tasks[0][0][0].multimodal_inputs["images"], paddle.Tensor)
+            self.assertEqual(client.num_tasks(), 0)
+
+            client.clear_data()
+            self.assertEqual(client.num_tasks(), 0)
+            self.assertEqual(list(client.client_read_flag), [1])
+        finally:
+            envs.FD_ENABLE_E2W_TENSOR_CONVERT = original_flag
+            server.cleanup()
+
+    def test_engine_worker_queue_connect_cache_and_disaggregate(self):
+        server, client = self._create_queue_pair()
+        try:
+            empty_task, all_read = client.get_connect_rdma_task()
+            self.assertIsNone(empty_task)
+            self.assertTrue(all_read)
+
+            client.put_connect_rdma_task({"id": 7})
+            connect_task, all_read = client.get_connect_rdma_task()
+            self.assertTrue(all_read)
+            self.assertEqual(connect_task["id"], 7)
+
+            self.assertIsNone(client.get_connect_rdma_task_response())
+            self.assertTrue(client.put_connect_rdma_task_response({"success": True}))
+            task_response = client.get_connect_rdma_task_response()
+            self.assertEqual(task_response, {"success": True})
+
+            self.assertEqual(client.get_cache_info(), [])
+            client.put_cache_info([{"cache": "v1"}])
+            self.assertEqual(client.num_cache_infos(), 1)
+            cache_infos = client.get_cache_info()
+            self.assertEqual(cache_infos, [{"cache": "v1"}])
+            self.assertEqual(client.get_cache_info(), [])
+            self.assertEqual(client.num_cache_infos(), 0)
+
+            self.assertTrue(client.put_finished_req([["req1", {"status": "ok"}]]))
+            client.finished_send_cache_list.append(["req1", {"error": "fail"}])
+            finished = client.get_finished_req()
+            self.assertEqual(finished, [["req1", {"error": "fail"}]])
+            self.assertEqual(client.get_finished_req(), [])
+
+            self.assertTrue(client.put_finished_add_cache_task_req(["req-a"]))
+            add_cache_finished = client.get_finished_add_cache_task_req()
+            self.assertEqual(add_cache_finished, ["req-a"])
+
+            self.assertTrue(client.disaggregate_queue_empty())
+            self.assertIsNone(client.get_disaggregated_tasks())
+            client.put_disaggregated_tasks({"task": 1})
+            client.put_disaggregated_tasks({"task": 2})
+            items = client.get_disaggregated_tasks()
+            self.assertEqual(items, [{"task": 1}, {"task": 2}])
+            self.assertTrue(client.disaggregate_queue_empty())
+        finally:
+            server.cleanup()
 
 
 if __name__ == "__main__":
