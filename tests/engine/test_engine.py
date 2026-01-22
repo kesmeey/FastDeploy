@@ -623,6 +623,7 @@ def test_check_worker_initialize_status(monkeypatch):
     cfg = build_cfg()
     engine = LLMEngine.__new__(LLMEngine)
     engine.cfg = cfg
+    engine.worker_init_status = {}  # Initialize the attribute
 
     stdout_lines = [
         b"Loading checkpoint shards: 50",
