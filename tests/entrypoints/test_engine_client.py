@@ -349,6 +349,13 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         with patch("fastdeploy.entrypoints.engine_client.IPCSignal") as mock_ipcsignal:
             mock_ipcsignal.return_value = MagicMock()
 
+            metrics_patch = patch("fastdeploy.entrypoints.engine_client.main_process_metrics")
+            mock_metrics = metrics_patch.start()
+            self.addCleanup(metrics_patch.stop)
+            mock_metrics.request_params_max_tokens.observe = Mock()
+            mock_metrics.prompt_tokens_total.inc = Mock()
+            mock_metrics.request_prompt_tokens.observe = Mock()
+
             with patch("fastdeploy.entrypoints.engine_client.StatefulSemaphore") as mock_semaphore:
                 mock_semaphore.return_value = MagicMock()
 

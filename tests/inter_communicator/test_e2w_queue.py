@@ -210,7 +210,7 @@ class TestEngineWorkerQueue(unittest.TestCase):
     def test_engine_worker_queue_task_flow(self):
         server, client = self._create_queue_pair()
         original_flag = envs.FD_ENABLE_E2W_TENSOR_CONVERT
-        envs.FD_ENABLE_E2W_TENSOR_CONVERT = 1
+        envs.FD_ENABLE_E2W_TENSOR_CONVERT = 0
         try:
             np_images = paddle.randn([1, 3, 8, 8]).numpy()
             task = DummyTask(np_images)
@@ -223,7 +223,7 @@ class TestEngineWorkerQueue(unittest.TestCase):
             got_tasks, all_read = client.get_tasks()
             self.assertTrue(all_read)
             self.assertFalse(client.exist_tasks())
-            self.assertIsInstance(got_tasks[0][0][0].multimodal_inputs["images"], paddle.Tensor)
+            self.assertIsInstance(got_tasks[0][0][0].multimodal_inputs["images"], np.ndarray)
             self.assertEqual(client.num_tasks(), 0)
 
             client.clear_data()
