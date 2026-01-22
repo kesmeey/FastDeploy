@@ -278,6 +278,233 @@ class TestEngineWorkerQueue(unittest.TestCase):
         finally:
             server.cleanup()
 
+    def test_engine_worker_queue_put_tasks_tensor_conversion(self):
+        """Test put_tasks with tensor conversion enabled"""
+        server, client = self._create_queue_pair()
+        original_flag = envs.FD_ENABLE_E2W_TENSOR_CONVERT
+        envs.FD_ENABLE_E2W_TENSOR_CONVERT = 1
+        try:
+            # Create task with numpy array that should be converted to tensor
+            np_images = paddle.randn([1, 3, 8, 8]).numpy()
+            task = DummyTask(np_images)
+            tasks = [[task]]
+
+            # Manually set client_read_flag to simulate other clients not ready
+            client.client_read_flag[0] = 0  # Not ready yet
+
+            client.put_tasks(tasks)
+
+            # Verify tensor conversion happened
+            self.assertIsInstance(task.multimodal_inputs["images"], paddle.Tensor)
+        finally:
+            envs.FD_ENABLE_E2W_TENSOR_CONVERT = original_flag
+            server.cleanup()
+
+    def test_engine_worker_queue_put_connect_rdma_task_wait(self):
+        """Test put_connect_rdma_task waits for all clients"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            # Create second client
+            client2 = EngineWorkerQueue(
+                address=server.address,
+                authkey=b"secret_key",
+                is_server=False,
+                num_client=2,
+                client_id=1,
+            )
+
+            # Set client flags to simulate waiting
+            client.client_get_connect_task_flag[1] = 0  # Second client not ready
+
+            # This should wait and then succeed
+            client.put_connect_rdma_task({"test": "data"})
+
+            # Verify task was set
+            self.assertEqual(len(server.connect_rdma_tasks), 1)
+            self.assertEqual(server.connect_rdma_tasks[0], {"test": "data"})
+
+            client2.cleanup()
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_put_connect_response_wait(self):
+        """Test put_connect_rdma_task_response waits for flag"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            # Set up initial state
+            client.can_put_next_connect_task_response_flag.set(0)  # Not ready
+
+            # This should wait for the flag
+            import threading
+            import time
+
+            def set_flag():
+                time.sleep(0.01)  # Small delay
+                client.can_put_next_connect_task_response_flag.set(1)
+
+            thread = threading.Thread(target=set_flag)
+            thread.start()
+
+            result = client.put_connect_rdma_task_response({"success": True})
+
+            thread.join()
+            # Should return False since not all clients have responded yet
+            self.assertFalse(result)
+
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_get_connect_response_wait(self):
+        """Test get_connect_rdma_task_response waits for all clients"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            # Create second client and set responses
+            client2 = EngineWorkerQueue(
+                address=server.address,
+                authkey=b"secret_key",
+                is_server=False,
+                num_client=2,
+                client_id=1,
+            )
+
+            # Both clients put responses
+            client.put_connect_rdma_task_response({"success": True})
+            client2.put_connect_rdma_task_response({"success": False})
+
+            # Now get should work
+            response = client.get_connect_rdma_task_response()
+            self.assertEqual(response["success"], False)  # Should be AND of all responses
+
+            client2.cleanup()
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_put_cache_info_wait(self):
+        """Test put_cache_info waits for all clients"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            client2 = EngineWorkerQueue(
+                address=server.address,
+                authkey=b"secret_key",
+                is_server=False,
+                num_client=2,
+                client_id=1,
+            )
+
+            # Set client flags to simulate waiting
+            client.client_read_info_flag[1] = 0  # Second client not ready
+
+            cache_info = [{"cache_id": "test"}]
+            client.put_cache_info(cache_info)
+
+            # Verify cache info was set
+            self.assertEqual(server.cache_infos, cache_info)
+
+            client2.cleanup()
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_put_finished_req_wait(self):
+        """Test put_finished_req waits for flag"""
+        server, client = self._create_queue_pair()
+        try:
+            # Set flag to not ready
+            client.can_put_next_send_cache_finished_flag.set(0)
+
+            # This should wait
+            def set_flag():
+                import time
+
+                time.sleep(0.01)
+                client.can_put_next_send_cache_finished_flag.set(1)
+
+            import threading
+
+            thread = threading.Thread(target=set_flag)
+            thread.start()
+
+            result = client.put_finished_req([["req1", {"status": "ok"}]])
+
+            thread.join()
+            self.assertTrue(result)
+
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_get_finished_req_wait(self):
+        """Test get_finished_req waits for all clients"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            client2 = EngineWorkerQueue(
+                address=server.address,
+                authkey=b"secret_key",
+                is_server=False,
+                num_client=2,
+                client_id=1,
+            )
+
+            # Both clients put finished requests
+            client.put_finished_req([["req1", {"status": "ok"}]])
+            client2.put_finished_req([["req1", {"error": "fail"}]])
+
+            # Get should return the one with error
+            result = client.get_finished_req()
+            self.assertEqual(result[0][1]["error"], "fail")
+
+            client2.cleanup()
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_put_add_cache_task_wait(self):
+        """Test put_finished_add_cache_task_req waits for flag"""
+        server, client = self._create_queue_pair()
+        try:
+            # Set flag to not ready
+            client.can_put_next_add_task_finished_flag.set(0)
+
+            def set_flag():
+                import time
+
+                time.sleep(0.01)
+                client.can_put_next_add_task_finished_flag.set(1)
+
+            import threading
+
+            thread = threading.Thread(target=set_flag)
+            thread.start()
+
+            result = client.put_finished_add_cache_task_req(["req1"])
+
+            thread.join()
+            self.assertTrue(result)
+
+        finally:
+            server.cleanup()
+
+    def test_engine_worker_queue_get_add_cache_task_wait(self):
+        """Test get_finished_add_cache_task_req waits for all clients"""
+        server, client = self._create_queue_pair(num_client=2)
+        try:
+            client2 = EngineWorkerQueue(
+                address=server.address,
+                authkey=b"secret_key",
+                is_server=False,
+                num_client=2,
+                client_id=1,
+            )
+
+            # Both clients put finished add cache tasks
+            client.put_finished_add_cache_task_req(["req1"])
+            client2.put_finished_add_cache_task_req(["req2"])
+
+            # Get should work (returns first one)
+            result = client.get_finished_add_cache_task_req()
+            self.assertIn(result, [["req1"], ["req2"]])
+
+            client2.cleanup()
+        finally:
+            server.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
