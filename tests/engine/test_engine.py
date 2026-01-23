@@ -687,6 +687,7 @@ def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
     engine.do_profile = 0
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
+    engine._wait_for_workers_ready = lambda: None
 
     # Mock cache manager processes
     mock_cache_processes = [DummyProcess(pid=123)]
@@ -700,7 +701,7 @@ def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
     monkeypatch.setattr(engine, "launch_components", lambda: None)
     monkeypatch.setattr(engine_module.time, "sleep", lambda x: None)
 
-    engine.launch()
+    engine.start()
 
     assert engine.cache_manager_processes == mock_cache_processes
 
@@ -716,6 +717,7 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     engine.do_profile = 1  # Will trigger profiling
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
+    engine._wait_for_workers_ready = lambda: None
 
     # Mock signals
     engine.loaded_model_signal = SimpleNamespace(value=[1])
@@ -747,7 +749,7 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     )
     monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
 
-    engine.launch()
+    engine.start()
 
     assert engine.cache_manager_processes == mock_cache_processes
 
@@ -761,6 +763,7 @@ def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
     engine.do_profile = 0
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
+    engine._wait_for_workers_ready = lambda: None
 
     # Mock signals
     engine.launched_cache_manager_signal = SimpleNamespace(value=[0])
@@ -786,7 +789,7 @@ def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
     )
     monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
 
-    engine.launch()
+    engine.start()
 
     assert engine.launched_cache_manager_signal.value[0] == 1
 
