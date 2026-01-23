@@ -310,15 +310,32 @@ class TestEngineClient(unittest.IsolatedAsyncioTestCase):
 class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     """Test cases for EngineClient.valid_parameters method"""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.metrics_mock = Mock()
+        cls.metrics_mock.request_params_max_tokens = Mock()
+        cls.metrics_mock.prompt_tokens_total = Mock()
+        cls.metrics_mock.request_prompt_tokens = Mock()
+        cls.metrics_patcher = patch(
+            "fastdeploy.entrypoints.engine_client.main_process_metrics",
+            cls.metrics_mock,
+        )
+        cls.metrics_patcher.start()
+        cls.support_connections_patcher = patch(
+            "fastdeploy.entrypoints.engine_client.FD_SUPPORT_MAX_CONNECTIONS",
+            100,
+        )
+        cls.support_connections_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "metrics_patcher"):
+            cls.metrics_patcher.stop()
+        if hasattr(cls, "support_connections_patcher"):
+            cls.support_connections_patcher.stop()
+
     def setUp(self):
         """Set up test fixtures for valid_parameters tests"""
-        self.metrics_mock = Mock()
-        self.metrics_mock.request_params_max_tokens = Mock()
-        self.metrics_mock.prompt_tokens_total = Mock()
-        self.metrics_mock.request_prompt_tokens = Mock()
-        self.metrics_patcher = patch("fastdeploy.entrypoints.engine_client.main_process_metrics", self.metrics_mock)
-        self.metrics_patcher.start()
-
         # Mock the dependencies
         mock_tokenizer = MagicMock()
         mock_tokenizer.sp_model = MagicMock()
@@ -405,10 +422,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                             self.engine_client.kv_cache_status_signal.value = np.array([0])
                             self.engine_client.prefix_tree_status_signal = Mock()
                             self.engine_client.prefix_tree_status_signal.value = np.array([0])
-
-    def tearDown(self):
-        if hasattr(self, "metrics_patcher"):
-            self.metrics_patcher.stop()
 
     def test_max_logprobs_valid_values(self):
         """Test valid max_logprobs values"""
