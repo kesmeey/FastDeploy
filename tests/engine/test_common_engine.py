@@ -521,6 +521,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def get_server_port(self):
+                return 0
+
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
 
@@ -586,6 +589,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def get_server_port(self):
+                return 0
+
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
 
@@ -619,6 +625,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         class DummyQ:
             def __init__(self, *a, **k):
                 pass
+
+            def get_server_port(self):
+                return 0
 
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
@@ -686,6 +695,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def get_server_port(self):
+                return 0
+
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
 
@@ -713,6 +725,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         class DummyQ:
             def __init__(self, *a, **k):
                 pass
+
+            def get_server_port(self):
+                return 0
 
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
@@ -1417,6 +1432,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def get_server_port(self):
+                return 0
+
         with (
             patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
             patch("fastdeploy.engine.common_engine.EngineCacheQueue", DummyQ),
@@ -1469,6 +1487,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         class DummyQ:
             def __init__(self, *a, **k):
                 pass
+
+            def get_server_port(self):
+                return 0
 
         with (
             patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
@@ -1525,6 +1546,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def get_server_port(self):
+                return 0
+
         with (
             patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
             patch("fastdeploy.engine.common_engine.EngineCacheQueue", DummyQ),
@@ -1579,6 +1603,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         class DummyQ:
             def __init__(self, *a, **k):
                 pass
+
+            def get_server_port(self):
+                return 0
 
         with (
             patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
@@ -1768,6 +1795,9 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         class DummyQ:
             def __init__(self, *a, **k):
                 pass
+
+            def get_server_port(self):
+                return 0
 
         with (
             patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
