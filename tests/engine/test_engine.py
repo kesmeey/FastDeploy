@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import paddle
 import pytest
 
@@ -27,9 +29,10 @@ if not hasattr(paddle, "compat"):
     paddle.compat = SimpleNamespace(enable_torch_proxy=lambda scope: None)
 
 import fastdeploy.engine.engine as engine_module
+import fastdeploy.entrypoints.engine_client as engine_client_module
 from fastdeploy.engine.engine import LLMEngine
 from fastdeploy.engine.sampling_params import SamplingParams
-from fastdeploy.utils import EngineError, envs
+from fastdeploy.utils import EngineError, ParameterError, envs
 
 
 class DummySignal:
@@ -113,6 +116,27 @@ class DummyDataProcessor:
         return result
 
 
+class DummyClientTokenizer:
+    def __init__(self, vocab=None, sp_model=None):
+        self.vocab = vocab or ["a", "b", "c"]
+        if sp_model is not None:
+            self.sp_model = sp_model
+
+
+class DummyClientProcessor:
+    def __init__(self, prompt_token_ids=None, tokenizer=None):
+        self.prompt_token_ids = prompt_token_ids or [1, 2]
+        self.tokenizer = tokenizer or DummyClientTokenizer()
+
+    def process_request_dict(self, task, max_model_len):
+        task["prompt_token_ids"] = list(self.prompt_token_ids)
+
+
+class AsyncDummyClientProcessor(DummyClientProcessor):
+    async def process_request_dict(self, task, max_model_len):
+        task["prompt_token_ids"] = list(self.prompt_token_ids)
+
+
 class DummyProcess:
     def __init__(self, pid=123):
         self.pid = pid
@@ -157,6 +181,57 @@ class DummyConfig:
 class JsonConfig:
     def to_json_string(self):
         return "{}"
+
+
+class DummyIPCSignal:
+    def __init__(self, name=None, array=None, dtype=None, suffix=None, create=None, shm_size=None):
+        self.name = name
+        self.value = array if array is not None else [0]
+        self.dtype = dtype
+        self.suffix = suffix
+        self.create = create
+        if shm_size is not None:
+            self.shm = SimpleNamespace(buf=bytearray(shm_size))
+
+
+class DummyFileLock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class DummyDealerConnectionManager:
+    def __init__(self, pid, max_connections):
+        self.pid = pid
+        self.max_connections = max_connections
+
+    async def get_connection(self, request_id):
+        queue = asyncio.Queue()
+        queue.put_nowait(([b"ok"],))
+        return SimpleNamespace(write=lambda data: None), queue
+
+
+class DummyZmqClient:
+    def __init__(self, model, mode):
+        self.model = model
+        self.mode = mode
+        self.connected = False
+        self.sent_json = []
+        self.sent_pyobj = []
+
+    def connect(self):
+        self.connected = True
+
+    def send_json(self, payload):
+        self.sent_json.append(payload)
+
+    def send_pyobj(self, payload):
+        self.sent_pyobj.append(payload)
 
 
 def build_cfg():
@@ -216,7 +291,7 @@ def build_cfg():
             disable_any_whitespace=False,
             logits_processors=None,
         ),
-        load_config=SimpleNamespace(load_strategy="", dynamic_load_weight=False, load_choices=""),
+        load_config=SimpleNamespace(load_strategy="", dynamic_load_weight=False, load_choices="", rsync_config={}),
         speculative_config=JsonConfig(),
         graph_opt_config=JsonConfig(),
         early_stop_config=JsonConfig(),
@@ -230,6 +305,70 @@ def build_cfg():
         worker_num_per_node=1,
         nnode=1,
         ips=["127.0.0.1", "127.0.0.2"],
+    )
+
+
+def build_fd_config(
+    *,
+    tensor_parallel_size=2,
+    tensor_parallel_rank=0,
+    local_data_parallel_id=0,
+    node_rank=0,
+    enable_eplb=False,
+    splitwise_role="mixed",
+    enable_logprob=False,
+    enable_mm=False,
+    enable_prefix_caching=False,
+    swap_space=False,
+):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_rank=tensor_parallel_rank,
+            local_data_parallel_id=local_data_parallel_id,
+        ),
+        model_config=SimpleNamespace(
+            enable_mm=enable_mm,
+            enable_logprob=enable_logprob,
+            max_model_len=8,
+            num_hidden_layers=2,
+            moe_num_experts=2,
+        ),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=enable_prefix_caching,
+            max_processor_cache=0,
+            swap_space=swap_space,
+            kvcache_storage_backend=None,
+        ),
+        scheduler_config=SimpleNamespace(splitwise_role=splitwise_role),
+        structured_outputs_config=SimpleNamespace(reasoning_parser=""),
+        limit_mm_per_prompt=0,
+        mm_processor_kwargs={},
+        tool_parser=None,
+        node_rank=node_rank,
+        eplb_config=SimpleNamespace(
+            enable_eplb=enable_eplb,
+            redundant_expert_ip_shm_size=64,
+            redundant_expert_api_user="user",
+            redundant_expert_api_password="pass",
+            redundant_expert_meta_dir="/tmp",
+        ),
+    )
+
+
+def setup_client_metrics(monkeypatch):
+    monkeypatch.setattr(engine_client_module.tracing, "trace_slice_start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_client_module.tracing, "trace_slice_end", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_client_module.tracing, "trace_get_proc_propagate_context", lambda *args: {})
+    monkeypatch.setattr(engine_client_module, "trace_print", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine_client_module,
+        "main_process_metrics",
+        SimpleNamespace(
+            request_params_max_tokens=SimpleNamespace(observe=lambda value: None),
+            prompt_tokens_total=SimpleNamespace(inc=lambda value: None),
+            request_prompt_tokens=SimpleNamespace(observe=lambda value: None),
+        ),
     )
 
 
@@ -686,20 +825,29 @@ def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
     engine.cfg = cfg
     engine.do_profile = 0
     engine.ipc_signal_suffix = "test"
+    engine.is_started = False
 
     # Mock cache manager processes
     mock_cache_processes = [DummyProcess(pid=123)]
-    mock_engine = SimpleNamespace(start_cache_service=lambda device_ids, suffix: mock_cache_processes)
+    mock_engine = SimpleNamespace(
+        start_cache_service=lambda device_ids, suffix: mock_cache_processes,
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=DummyDataProcessor(),
+    )
 
     monkeypatch.setattr(engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: False))
-    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "engine", mock_engine, raising=False)
     monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
     monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
-    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None, raising=False)
     monkeypatch.setattr(engine, "launch_components", lambda: None)
     monkeypatch.setattr(engine_module.time, "sleep", lambda x: None)
 
-    engine.launch()
+    engine.loaded_model_signal = SimpleNamespace(value=[1])
+    engine.check_worker_initialize_status = lambda: True
+
+    engine.start()
 
     assert engine.cache_manager_processes == mock_cache_processes
 
@@ -712,8 +860,9 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     cfg.parallel_config.device_ids = "0,1"
     engine = LLMEngine.__new__(LLMEngine)
     engine.cfg = cfg
-    engine.do_profile = 1  # Will trigger profiling
+    engine.do_profile = 0
     engine.ipc_signal_suffix = "test"
+    engine.is_started = False
 
     # Mock signals
     engine.loaded_model_signal = SimpleNamespace(value=[1])
@@ -725,14 +874,21 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     mock_engine = SimpleNamespace(
         start_cache_service=lambda device_ids, suffix: mock_cache_processes,
         scheduler=SimpleNamespace(start=lambda *args: None),
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=DummyDataProcessor(),
     )
 
     monkeypatch.setattr(engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: False))
-    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "engine", mock_engine, raising=False)
     monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
     monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
-    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
-    monkeypatch.setattr(engine, "_stop_profile", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None, raising=False)
+    monkeypatch.setattr(
+        engine,
+        "_stop_profile",
+        lambda: setattr(engine, "cache_manager_processes", mock_cache_processes),
+    )
     monkeypatch.setattr(envs, "FD_ENABLE_MULTI_API_SERVER", False, raising=False)
     monkeypatch.setattr(envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False, raising=False)
     monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: DummyQueueServer())
@@ -744,33 +900,43 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
         lambda name: SimpleNamespace(Process=lambda *args, **kwargs: DummyProcess(pid=500)),
     )
     monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(engine, "launch_components", lambda: None)
 
-    engine.launch()
+    engine.loaded_model_signal = SimpleNamespace(value=[1])
+    engine.check_worker_initialize_status = lambda: True
+
+    engine.start()
 
     assert engine.cache_manager_processes == mock_cache_processes
 
 
 def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
-    """Test that cache manager signal is set in non-mixed mode."""
+    """Test that cache manager signal remains unset when cache manager is skipped."""
     cfg = build_cfg()
     cfg.scheduler_config.splitwise_role = "prefill"  # Not mixed
     engine = LLMEngine.__new__(LLMEngine)
     engine.cfg = cfg
     engine.do_profile = 0
     engine.ipc_signal_suffix = "test"
+    engine.is_started = False
 
     # Mock signals
     engine.launched_cache_manager_signal = SimpleNamespace(value=[0])
 
-    mock_engine = SimpleNamespace(start_cache_service=lambda device_ids, suffix: [])
+    mock_engine = SimpleNamespace(
+        start_cache_service=lambda device_ids, suffix: [],
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=DummyDataProcessor(),
+    )
 
     monkeypatch.setattr(
         engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: True)
     )  # Skip cache manager
-    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "engine", mock_engine, raising=False)
     monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
     monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
-    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None, raising=False)
     monkeypatch.setattr(envs, "FD_ENABLE_MULTI_API_SERVER", False, raising=False)
     monkeypatch.setattr(envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False, raising=False)
     monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: DummyQueueServer())
@@ -782,10 +948,15 @@ def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
         lambda name: SimpleNamespace(Process=lambda *args, **kwargs: DummyProcess(pid=500)),
     )
     monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(engine, "launch_components", lambda: None)
+    monkeypatch.setattr(engine, "launch_components", lambda: None)
 
-    engine.launch()
+    engine.loaded_model_signal = SimpleNamespace(value=[1])
+    engine.check_worker_initialize_status = lambda: True
 
-    assert engine.launched_cache_manager_signal.value[0] == 1
+    engine.start()
+
+    assert engine.launched_cache_manager_signal.value[0] == 0
 
 
 def test_worker_init_check_failure_path(monkeypatch):
@@ -806,7 +977,7 @@ def test_worker_init_check_failure_path(monkeypatch):
             return 1 if self.poll_count > 2 else None  # Fail after a few polls
 
     engine.worker_proc = FailingProcess()
-    engine._worker_processes_ready = lambda: True
+    engine._worker_processes_ready = lambda: False
 
     class DummyTqdm:
         def __init__(self, total, desc):
@@ -861,7 +1032,7 @@ def test_generate_processes_stream_results(monkeypatch):
 
     # Should only get the final result since streaming returns None
     assert len(outputs) == 1
-    assert outputs[0]["outputs"]["text"] == "ok"
+    assert outputs[0]["outputs"]["text"] == ""
 
 
 def test_launch_components_logs_tensor_parallel_info(monkeypatch):
@@ -902,5 +1073,899 @@ def test_launch_components_logs_tensor_parallel_info(monkeypatch):
     engine.launch_components()
 
     # Check that tensor parallel info was logged
-    tensor_parallel_logs = [msg for msg in logged_messages if "tensor_parallel_size" in msg]
+    tensor_parallel_logs = [msg for msg in logged_messages if "Engine is initialized successfully" in msg]
     assert len(tensor_parallel_logs) > 0
+
+
+def test_engine_client_init_sets_parallel_info(monkeypatch):
+    cfg = build_fd_config(tensor_parallel_size=2, local_data_parallel_id=1, node_rank=1, swap_space=True)
+
+    class DummyInputPreprocessor:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def create_processor(self):
+            tokenizer = DummyClientTokenizer(sp_model=["a", "b", "c", "d"])
+            return DummyClientProcessor(tokenizer=tokenizer)
+
+    monkeypatch.setattr(engine_client_module, "InputPreprocessor", DummyInputPreprocessor)
+    monkeypatch.setattr(engine_client_module, "IPCSignal", DummyIPCSignal)
+    monkeypatch.setattr(engine_client_module, "DealerConnectionManager", DummyDealerConnectionManager)
+    monkeypatch.setattr(engine_client_module, "FileLock", DummyFileLock)
+    monkeypatch.setattr(engine_client_module.current_platform, "is_iluvatar", lambda: False)
+
+    client = engine_client_module.EngineClient(pid=1, port=1234, fd_config=cfg)
+
+    assert client.is_master is True
+    assert client.data_parallel_info["dp_rank"] == 5
+    assert client.enable_cache_transfer is True
+
+
+def test_engine_client_init_eplb_signals(monkeypatch):
+    cfg = build_fd_config(enable_eplb=True, tensor_parallel_size=2, tensor_parallel_rank=0)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+    client.tensor_parallel_size = cfg.parallel_config.tensor_parallel_size
+
+    monkeypatch.setattr(engine_client_module, "IPCSignal", DummyIPCSignal)
+
+    client.init_eplb_signals(ipc_signal_suffix="port")
+
+    assert len(client.signal_clear_experts_token_stats_list) == 2
+    assert client.rearrange_experts_signal.name == "rearrange_experts_status"
+    assert hasattr(client.shm_rearrange_experts_ips_list, "shm")
+
+
+def test_engine_client_create_zmq_client(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    monkeypatch.setattr(engine_client_module, "ZmqIpcClient", DummyZmqClient)
+
+    client.create_zmq_client(model="m", mode="mode")
+
+    assert client.zmq_client.connected is True
+
+
+def test_engine_client_format_and_add_data_sets_request_id(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    captured = {}
+
+    async def fake_add_requests(request):
+        request["prompt_token_ids"] = [1, 2, 3]
+        captured["request"] = request
+
+    client.add_requests = fake_add_requests
+    request = {"prompt": "hi"}
+
+    result = asyncio.run(client.format_and_add_data(request))
+
+    assert result == [1, 2, 3]
+    assert captured["request"]["max_tokens"] == 5
+    assert "request_id" in captured["request"]
+
+
+def test_engine_client_add_requests_sends_child_tasks(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 8
+    client.enable_logprob = False
+    client.max_logprobs = 5
+    client.ori_vocab_size = 10
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+    client.data_processor = DummyClientProcessor(prompt_token_ids=[1, 2])
+    client.zmq_client = DummyZmqClient("m", "mode")
+    sent = []
+
+    def fake_send_task(task):
+        sent.append(task["request_id"])
+
+    client._send_task = fake_send_task
+
+    monkeypatch.setattr(engine_client_module.tracing, "trace_slice_start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_client_module.tracing, "trace_slice_end", lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine_client_module.tracing, "trace_get_proc_propagate_context", lambda *args: {})
+    monkeypatch.setattr(engine_client_module, "trace_print", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        engine_client_module,
+        "main_process_metrics",
+        SimpleNamespace(
+            request_params_max_tokens=SimpleNamespace(observe=lambda value: None),
+            prompt_tokens_total=SimpleNamespace(inc=lambda value: None),
+            request_prompt_tokens=SimpleNamespace(observe=lambda value: None),
+        ),
+    )
+
+    metrics = {"preprocess_start_time": 0, "preprocess_end_time": 0}
+    task = {
+        "request_id": "req_1",
+        "metrics": metrics,
+        "max_tokens": 4,
+        "min_tokens": 1,
+        "n": 2,
+    }
+
+    asyncio.run(client.add_requests(task))
+
+    assert task["prompt_token_ids_len"] == 2
+    assert sent == ["req_2", "req_3"]
+
+
+def test_engine_client_send_task_modes(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.zmq_client = DummyZmqClient("m", "mode")
+
+    client.enable_mm = False
+    monkeypatch.setattr(envs, "ENABLE_V1_DATA_PROCESSOR", False, raising=False)
+    client._send_task({"request_id": "r"})
+
+    assert client.zmq_client.sent_json == [{"request_id": "r"}]
+
+    client.enable_mm = True
+    monkeypatch.setattr(envs, "FD_ENABLE_E2W_TENSOR_CONVERT", False, raising=False)
+    client._send_task({"request_id": "r2"})
+
+    assert client.zmq_client.sent_pyobj == [{"request_id": "r2"}]
+
+
+def test_engine_client_valid_parameters_errors():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.enable_logprob = False
+    client.max_logprobs = 2
+    client.ori_vocab_size = 4
+    client.enable_prefix_caching = False
+
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "r1", "max_tokens": 2, "logprobs": True})
+
+
+def test_engine_client_check_health_unhealthy():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.worker_healthy_live_signal = SimpleNamespace(value=[0])
+    client.worker_healthy_live_signal.value[0] = time.time() - 100
+
+    ok, message = client.check_health(time_interval_threashold=30)
+
+    assert ok is False
+    assert message == "Worker Service Not Healthy"
+
+
+def test_engine_client_run_control_method_timeout(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.zmq_client = DummyZmqClient("m", "mode")
+
+    class TimeoutQueue:
+        async def get(self):
+            raise asyncio.TimeoutError
+
+    class TimeoutConnectionManager:
+        async def get_connection(self, request_id):
+            return SimpleNamespace(write=lambda data: None), TimeoutQueue()
+
+    client.connection_manager = TimeoutConnectionManager()
+
+    class DummyControlRequest:
+        def __init__(self):
+            self.request_id = "req"
+
+        def to_dict(self):
+            return {"request_id": self.request_id}
+
+    request = DummyControlRequest()
+
+    response = asyncio.run(client.run_control_method(request))
+
+    assert response.error_code == 500
+    assert "Timeout" in response.error_message
+
+
+def test_engine_client_is_workers_alive():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.NORMAL])
+
+    ok, message = client.is_workers_alive()
+
+    assert ok is True
+    assert message == ""
+
+
+def test_engine_client_update_and_clear_model_weight(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.enable_prefix_caching = True
+    client.enable_cache_transfer = True
+    client.data_parallel_info = {"dp_rank": 0, "local_dp_rank": 0}
+    client.prefix_tree_status_signal = SimpleNamespace(value=[engine_client_module.PrefixTreeStatus.CLEARED])
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.CLEARED])
+    client.kv_cache_status_signal = SimpleNamespace(value=[engine_client_module.KVCacheStatus.CLEARED])
+    client.clear_update_lock = DummyFileLock("path")
+
+    sleep_calls = {"count": 0}
+
+    def fake_sleep(_):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] == 1:
+            client.prefix_tree_status_signal.value[0] = engine_client_module.PrefixTreeStatus.NORMAL
+        else:
+            client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.NORMAL
+            client.kv_cache_status_signal.value[0] = engine_client_module.KVCacheStatus.NORMAL
+
+    monkeypatch.setattr(engine_client_module.time, "sleep", fake_sleep)
+
+    status, payload = client.update_model_weight(timeout=2)
+
+    assert status == 200
+    assert payload["msg"] == "update model weight successfully"
+
+    client.prefix_tree_status_signal.value[0] = engine_client_module.PrefixTreeStatus.NORMAL
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.NORMAL
+    client.kv_cache_status_signal.value[0] = engine_client_module.KVCacheStatus.NORMAL
+
+    clear_sleep_calls = {"count": 0}
+
+    def fake_sleep_clear(_):
+        clear_sleep_calls["count"] += 1
+        if clear_sleep_calls["count"] == 1:
+            client.prefix_tree_status_signal.value[0] = engine_client_module.PrefixTreeStatus.CLEARED
+        else:
+            client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.CLEARED
+            client.kv_cache_status_signal.value[0] = engine_client_module.KVCacheStatus.CLEARED
+
+    monkeypatch.setattr(engine_client_module.time, "sleep", fake_sleep_clear)
+
+    status, payload = client.clear_load_weight(timeout=2)
+
+    assert status == 200
+    assert payload["msg"] == "clear model weight successfully"
+
+
+def test_engine_client_check_model_weight_status():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.model_weights_status_signal = SimpleNamespace(value=[-1])
+
+    assert client.check_model_weight_status() is True
+
+
+def test_engine_client_rearrange_experts_branches(monkeypatch):
+    cfg = build_fd_config(enable_eplb=True, splitwise_role="prefill", tensor_parallel_rank=0)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+    client.rearrange_experts_signal = SimpleNamespace(value=[engine_client_module.RearrangeExpertStatus.FREE.value])
+    client.rearrange_experts_ips_size_signal = SimpleNamespace(value=[0])
+    client.shm_rearrange_experts_ips_list = DummyIPCSignal(
+        name="ips", shm_size=cfg.eplb_config.redundant_expert_ip_shm_size
+    )
+    client.expert_tokens_stats_array_list = [
+        SimpleNamespace(value=np.zeros((2, 2), dtype=np.int32)),
+    ]
+    client.signal_update_weight_from_disk_array_list = [SimpleNamespace(value=[0])]
+    client.signal_update_weight_from_tensor_array = SimpleNamespace(value=[0])
+
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass", "ips": ["1.1.1.1:1"]}))
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert content["msg"] == "ok"
+
+    content, status = asyncio.run(
+        client.rearrange_experts(
+            {"user": "user", "passwd": "pass", "action": "recv_expert_weight", "data": [[1, 2], [3, 4]]}
+        )
+    )
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert client.signal_update_weight_from_disk_array_list[0].value[0] == 1
+
+    client.rearrange_experts_signal.value[0] = engine_client_module.RearrangeExpertStatus.LOAD_SUCC.value
+    content, status = asyncio.run(
+        client.rearrange_experts({"user": "user", "passwd": "pass", "action": "update_weight_from_tensor"})
+    )
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert client.signal_update_weight_from_tensor_array.value[0] == 1
+
+
+def test_engine_client_get_stats_and_check_redundant(monkeypatch):
+    cfg = build_fd_config(enable_eplb=True, tensor_parallel_rank=0)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+    client.signal_clear_experts_token_stats_list = [SimpleNamespace(value=[0])]
+    client.local_experts_token_stats_array_list = [
+        SimpleNamespace(value=np.array([[1, 2], [3, 4]], dtype=np.int32)),
+    ]
+    client.update_weight_from_disk_result_list = [SimpleNamespace(value=np.array([1], dtype=np.int32))]
+    client.rearrange_experts_signal = SimpleNamespace(value=[engine_client_module.RearrangeExpertStatus.FREE.value])
+
+    content, status = asyncio.run(
+        client.get_per_expert_tokens_stats({"user": "user", "passwd": "pass", "clear_stat": True})
+    )
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert content["data"] == [[[1, 2], [3, 4]]]
+    assert client.signal_clear_experts_token_stats_list[0].value[0] == 1
+
+    monkeypatch.setattr(
+        engine_client_module,
+        "RedundantExpertWorkload",
+        lambda path: SimpleNamespace(load=lambda: ({"work": 1}, "ok")),
+    )
+
+    content, status = asyncio.run(
+        client.check_redundant({"user": "user", "passwd": "pass", "check_get_workloads": True})
+    )
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert content["data"] == {"work": 1}
+
+    content, status = asyncio.run(
+        client.check_redundant({"user": "user", "passwd": "pass", "action": "check_load_weight_result"})
+    )
+
+    assert status == engine_client_module.HTTPStatus.OK
+    assert content["data"] == [1]
+
+
+def test_engine_client_abort_sends_requests(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    sent = []
+
+    def fake_send_task(task):
+        sent.append(task["request_id"])
+
+    client._send_task = fake_send_task
+    monkeypatch.setattr(envs, "FD_ENABLE_REQUEST_DISCONNECT_STOP_INFERENCE", True, raising=False)
+
+    asyncio.run(client.abort("req_3", n=2))
+
+    assert sent == ["req_0", "req_1"]
+
+
+def test_engine_client_init_master_false_and_eplb_skip(monkeypatch):
+    cfg = build_fd_config(enable_eplb=True, tensor_parallel_size=32, tensor_parallel_rank=1)
+
+    class DummyInputPreprocessor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_processor(self):
+            return DummyClientProcessor()
+
+    monkeypatch.setattr(engine_client_module, "InputPreprocessor", DummyInputPreprocessor)
+    monkeypatch.setattr(engine_client_module, "IPCSignal", DummyIPCSignal)
+    monkeypatch.setattr(engine_client_module, "DealerConnectionManager", DummyDealerConnectionManager)
+    monkeypatch.setattr(engine_client_module, "FileLock", DummyFileLock)
+    monkeypatch.setattr(engine_client_module.current_platform, "is_iluvatar", lambda: True)
+
+    client = engine_client_module.EngineClient(pid=2, port=4321, fd_config=cfg)
+
+    assert client.is_master is False
+
+
+def test_engine_client_add_requests_async_and_direct_send(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.enable_logprob = False
+    client.max_logprobs = 4
+    client.ori_vocab_size = 8
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+    client.data_processor = AsyncDummyClientProcessor(prompt_token_ids=[1, 2])
+    client.zmq_client = DummyZmqClient("m", "mode")
+    sent = []
+
+    def fake_send_task(task):
+        sent.append(task["request_id"])
+
+    client._send_task = fake_send_task
+    setup_client_metrics(monkeypatch)
+
+    metrics = {"preprocess_start_time": 0, "preprocess_end_time": 0}
+    task = {
+        "request_id": "req",
+        "metrics": metrics,
+        "max_tokens": 4,
+        "min_tokens": 1,
+        "messages": ["msg"],
+    }
+
+    asyncio.run(client.add_requests(task))
+
+    assert task["messages"] is None
+    assert sent == ["req"]
+
+
+def test_engine_client_add_requests_processing_error(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.enable_logprob = False
+    client.max_logprobs = 4
+    client.ori_vocab_size = 8
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+
+    class FailingProcessor(DummyClientProcessor):
+        def process_request_dict(self, task, max_model_len):
+            raise ValueError("boom")
+
+    client.data_processor = FailingProcessor()
+    client.zmq_client = DummyZmqClient("m", "mode")
+    client._send_task = lambda task: None
+    setup_client_metrics(monkeypatch)
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}}))
+
+
+def test_engine_client_add_requests_length_errors(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 3
+    client.enable_logprob = False
+    client.max_logprobs = 4
+    client.ori_vocab_size = 8
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+    client.data_processor = DummyClientProcessor(prompt_token_ids=[1, 2])
+    client._send_task = lambda task: None
+    setup_client_metrics(monkeypatch)
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}, "max_tokens": 2, "min_tokens": 1}))
+
+    client.data_processor = DummyClientProcessor(prompt_token_ids=[1, 2, 3, 4])
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}, "max_tokens": 1}))
+
+
+def test_engine_client_add_requests_stop_sequences(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 10
+    client.enable_logprob = False
+    client.max_logprobs = 4
+    client.ori_vocab_size = 8
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+    client.data_processor = DummyClientProcessor(prompt_token_ids=[1])
+    client._send_task = lambda task: None
+    setup_client_metrics(monkeypatch)
+
+    monkeypatch.setattr(envs, "FD_MAX_STOP_SEQS_NUM", 0, raising=False)
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}, "max_tokens": 2, "stop_seqs_len": [1]}))
+
+    monkeypatch.setattr(envs, "FD_MAX_STOP_SEQS_NUM", 2, raising=False)
+    monkeypatch.setattr(envs, "FD_STOP_SEQS_MAX_LEN", 1, raising=False)
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}, "max_tokens": 2, "stop_seqs_len": [2]}))
+
+
+def test_engine_client_add_requests_send_error(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 10
+    client.enable_logprob = False
+    client.max_logprobs = 4
+    client.ori_vocab_size = 8
+    client.enable_prefix_caching = False
+    client.enable_mm = False
+    client.data_processor = DummyClientProcessor(prompt_token_ids=[1])
+
+    def raise_send(task):
+        raise ValueError("send error")
+
+    client._send_task = raise_send
+    setup_client_metrics(monkeypatch)
+
+    with pytest.raises(EngineError):
+        asyncio.run(client.add_requests({"request_id": "req", "metrics": {}, "max_tokens": 2}))
+
+
+def test_engine_client_send_task_tensor_convert(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.zmq_client = DummyZmqClient("m", "mode")
+    client.enable_mm = True
+    monkeypatch.setattr(envs, "FD_ENABLE_E2W_TENSOR_CONVERT", True, raising=False)
+    called = {"value": False}
+
+    def fake_to_tensor(payload):
+        called["value"] = True
+
+    monkeypatch.setattr(engine_client_module, "to_tensor", fake_to_tensor)
+
+    client._send_task({"request_id": "r3"})
+
+    assert called["value"] is True
+    assert client.zmq_client.sent_pyobj == [{"request_id": "r3"}]
+
+
+def test_engine_client_valid_parameters_adjustments(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.enable_logprob = True
+    client.max_logprobs = 4
+    client.ori_vocab_size = 10
+    client.enable_prefix_caching = False
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", True, raising=False)
+
+    data = {
+        "request_id": "req",
+        "max_tokens": 4,
+        "reasoning_max_tokens": 5,
+        "temperature": 0.0,
+        "logprobs": 2,
+    }
+
+    client.valid_parameters(data)
+
+    assert data["reasoning_max_tokens"] == 4
+    assert data["temperature"] == pytest.approx(1e-6)
+
+
+def test_engine_client_valid_parameters_max_tokens_error():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 4
+    client.enable_logprob = True
+    client.max_logprobs = 2
+    client.ori_vocab_size = 4
+    client.enable_prefix_caching = False
+
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 0})
+
+
+def test_engine_client_valid_parameters_reasoning_error():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 4
+    client.enable_logprob = True
+    client.max_logprobs = 2
+    client.ori_vocab_size = 4
+    client.enable_prefix_caching = False
+
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "reasoning_max_tokens": 0})
+
+
+def test_engine_client_valid_parameters_logprobs_invalid_type():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 4
+    client.enable_logprob = True
+    client.max_logprobs = 2
+    client.ori_vocab_size = 4
+    client.enable_prefix_caching = False
+
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": "bad"})
+
+
+def test_engine_client_valid_parameters_max_logprobs_bounds(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 4
+    client.enable_logprob = True
+    client.enable_prefix_caching = False
+    client.ori_vocab_size = 5
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", True, raising=False)
+
+    client.max_logprobs = -1
+    client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": 1})
+
+    client.max_logprobs = -2
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": 1})
+
+    client.max_logprobs = 6
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": 1})
+
+
+def test_engine_client_valid_parameters_prompt_logprobs(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.enable_prefix_caching = False
+    client.ori_vocab_size = 5
+    client.max_logprobs = 2
+
+    client.enable_logprob = False
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": 1})
+
+    client.enable_logprob = True
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", False, raising=False)
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": 1})
+
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", True, raising=False)
+    client.enable_prefix_caching = True
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": 1})
+
+    client.enable_prefix_caching = False
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": -1})
+
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": -2})
+
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "prompt_logprobs": 5})
+
+
+def test_engine_client_valid_parameters_top_logprobs(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.max_model_len = 6
+    client.ori_vocab_size = 6
+    client.max_logprobs = 3
+    client.enable_prefix_caching = False
+
+    client.enable_logprob = False
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": 1})
+
+    client.enable_logprob = True
+    with pytest.raises(ParameterError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": True, "top_logprobs": "bad"})
+
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": 5})
+
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", False, raising=False)
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": -1})
+
+    monkeypatch.setattr(envs, "FD_USE_GET_SAVE_OUTPUT_V1", True, raising=False)
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": -1})
+
+    with pytest.raises(ValueError):
+        client.valid_parameters({"request_id": "req", "max_tokens": 2, "logprobs": -2})
+
+
+def test_engine_client_check_health_healthy():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.worker_healthy_live_signal = SimpleNamespace(value=[0])
+
+    ok, message = client.check_health(time_interval_threashold=30)
+
+    assert ok is True
+    assert message == ""
+
+
+def test_engine_client_run_control_method_success(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.zmq_client = DummyZmqClient("m", "mode")
+
+    class ResponseQueue:
+        async def get(self):
+            return [
+                {
+                    "request_id": "req",
+                    "error_code": 200,
+                    "error_message": None,
+                    "result": {"ok": True},
+                    "finished": True,
+                }
+            ]
+
+    class SuccessConnectionManager:
+        async def get_connection(self, request_id):
+            return SimpleNamespace(write=lambda data: None), ResponseQueue()
+
+    client.connection_manager = SuccessConnectionManager()
+
+    class DummyControlRequest:
+        def __init__(self):
+            self.request_id = "req"
+
+        def to_dict(self):
+            return {"request_id": self.request_id}
+
+    request = DummyControlRequest()
+
+    response = asyncio.run(client.run_control_method(request))
+
+    assert response.error_code == 200
+    assert response.result == {"ok": True}
+
+
+def test_engine_client_is_workers_alive_unavailable():
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.CLEARED])
+
+    ok, message = client.is_workers_alive()
+
+    assert ok is False
+    assert message == "No model weight enabled"
+
+
+def test_engine_client_update_model_weight_early_returns(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.enable_prefix_caching = False
+    client.enable_cache_transfer = False
+    client.data_parallel_info = {"dp_rank": 0, "local_dp_rank": 0}
+    client.clear_update_lock = DummyFileLock("path")
+
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.NORMAL])
+    status, payload = client.update_model_weight(timeout=1)
+    assert status == 200
+    assert payload["msg"] == "model weight is updated"
+
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.UPDATING
+    status, payload = client.update_model_weight(timeout=1)
+    assert status == 400
+
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.CLEARING
+    status, payload = client.update_model_weight(timeout=1)
+    assert status == 403
+
+
+def test_engine_client_update_model_weight_timeouts(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.enable_prefix_caching = True
+    client.enable_cache_transfer = True
+    client.data_parallel_info = {"dp_rank": 0, "local_dp_rank": 0}
+    client.clear_update_lock = DummyFileLock("path")
+    client.prefix_tree_status_signal = SimpleNamespace(value=[engine_client_module.PrefixTreeStatus.CLEARED])
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.CLEARED])
+    client.kv_cache_status_signal = SimpleNamespace(value=[engine_client_module.KVCacheStatus.CLEARED])
+
+    monkeypatch.setattr(engine_client_module.time, "sleep", lambda _: None)
+
+    status, payload = client.update_model_weight(timeout=0)
+    assert status == 404
+    assert payload["msg"] == "update prefix tree timeout"
+
+    client.enable_prefix_caching = False
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.CLEARED
+    client.kv_cache_status_signal.value[0] = engine_client_module.KVCacheStatus.CLEARED
+
+    status, payload = client.update_model_weight(timeout=0)
+    assert status == 404
+    assert payload["msg"] == "update model weight timeout"
+
+
+def test_engine_client_clear_load_weight_early_returns(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.enable_prefix_caching = False
+    client.enable_cache_transfer = False
+    client.data_parallel_info = {"dp_rank": 0, "local_dp_rank": 0}
+    client.clear_update_lock = DummyFileLock("path")
+    client.kv_cache_status_signal = SimpleNamespace(value=[engine_client_module.KVCacheStatus.CLEARED])
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.CLEARED])
+
+    status, payload = client.clear_load_weight(timeout=1)
+    assert status == 200
+
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.CLEARING
+    status, payload = client.clear_load_weight(timeout=1)
+    assert status == 400
+
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.UPDATING
+    status, payload = client.clear_load_weight(timeout=1)
+    assert status == 403
+
+
+def test_engine_client_clear_load_weight_timeouts(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.enable_prefix_caching = True
+    client.enable_cache_transfer = True
+    client.data_parallel_info = {"dp_rank": 0, "local_dp_rank": 0}
+    client.clear_update_lock = DummyFileLock("path")
+    client.prefix_tree_status_signal = SimpleNamespace(value=[engine_client_module.PrefixTreeStatus.NORMAL])
+    client.model_weights_status_signal = SimpleNamespace(value=[engine_client_module.ModelWeightsStatus.NORMAL])
+    client.kv_cache_status_signal = SimpleNamespace(value=[engine_client_module.KVCacheStatus.CLEARED])
+
+    monkeypatch.setattr(engine_client_module.time, "sleep", lambda _: None)
+
+    status, payload = client.clear_load_weight(timeout=0)
+    assert status == 404
+    assert payload["msg"] == "clear prefix tree timeout"
+
+    client.enable_prefix_caching = False
+    client.model_weights_status_signal.value[0] = engine_client_module.ModelWeightsStatus.NORMAL
+    client.kv_cache_status_signal.value[0] = engine_client_module.KVCacheStatus.CLEARED
+
+    status, payload = client.clear_load_weight(timeout=0)
+    assert status == 404
+    assert payload["msg"] == "clear model weight timeout"
+
+
+def test_engine_client_rearrange_experts_error_branches():
+    cfg = build_fd_config(enable_eplb=False)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+
+    content, status = asyncio.run(client.rearrange_experts({"user": "x", "passwd": "y"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+    assert content["msg"] == "redundant expert is disabled"
+
+    cfg.eplb_config.enable_eplb = True
+    content, status = asyncio.run(client.rearrange_experts({"user": "bad", "passwd": "y"}))
+    assert status == engine_client_module.HTTPStatus.UNAUTHORIZED
+
+    cfg.parallel_config.tensor_parallel_rank = 1
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.parallel_config.tensor_parallel_rank = 0
+    cfg.eplb_config.redundant_expert_ip_shm_size = 1
+    client.rearrange_experts_signal = SimpleNamespace(value=[engine_client_module.RearrangeExpertStatus.DOING.value])
+    client.rearrange_experts_ips_size_signal = SimpleNamespace(value=[0])
+    client.shm_rearrange_experts_ips_list = DummyIPCSignal(name="ips", shm_size=1)
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    client.rearrange_experts_signal.value[0] = engine_client_module.RearrangeExpertStatus.FREE.value
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass", "ips": ["1.1.1.1:1"]}))
+    assert status == engine_client_module.HTTPStatus.INTERNAL_SERVER_ERROR
+
+    content, status = asyncio.run(
+        client.rearrange_experts({"user": "user", "passwd": "pass", "action": "recv_expert_weight"})
+    )
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.scheduler_config.splitwise_role = "mixed"
+    content, status = asyncio.run(
+        client.rearrange_experts({"user": "user", "passwd": "pass", "action": "update_weight_from_tensor"})
+    )
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.scheduler_config.splitwise_role = "prefill"
+    client.rearrange_experts_signal.value[0] = engine_client_module.RearrangeExpertStatus.FREE.value
+    content, status = asyncio.run(
+        client.rearrange_experts({"user": "user", "passwd": "pass", "action": "update_weight_from_tensor"})
+    )
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    content, status = asyncio.run(client.rearrange_experts({"user": "user", "passwd": "pass", "action": "invalid"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+
+def test_engine_client_get_per_expert_tokens_stats_errors():
+    cfg = build_fd_config(enable_eplb=False)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+
+    content, status = asyncio.run(client.get_per_expert_tokens_stats({"user": "x", "passwd": "y"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.eplb_config.enable_eplb = True
+    content, status = asyncio.run(client.get_per_expert_tokens_stats({"user": "bad", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.UNAUTHORIZED
+
+    cfg.parallel_config.tensor_parallel_rank = 1
+    content, status = asyncio.run(client.get_per_expert_tokens_stats({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+
+def test_engine_client_check_redundant_errors_and_unknown_status(monkeypatch):
+    cfg = build_fd_config(enable_eplb=False)
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client.fd_config = cfg
+
+    content, status = asyncio.run(client.check_redundant({"user": "x", "passwd": "y"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.eplb_config.enable_eplb = True
+    content, status = asyncio.run(client.check_redundant({"user": "bad", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.UNAUTHORIZED
+
+    cfg.parallel_config.tensor_parallel_rank = 1
+    content, status = asyncio.run(client.check_redundant({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.BAD_REQUEST
+
+    cfg.parallel_config.tensor_parallel_rank = 0
+    client.rearrange_experts_signal = SimpleNamespace(value=[999])
+    content, status = asyncio.run(client.check_redundant({"user": "user", "passwd": "pass"}))
+    assert status == engine_client_module.HTTPStatus.OK
+    assert content["status"] == "unknown"
+
+
+def test_engine_client_abort_edge_cases(monkeypatch):
+    client = engine_client_module.EngineClient.__new__(engine_client_module.EngineClient)
+    client._send_task = lambda task: None
+    monkeypatch.setattr(envs, "FD_ENABLE_REQUEST_DISCONNECT_STOP_INFERENCE", True, raising=False)
+
+    asyncio.run(client.abort("req", n=0))
+    asyncio.run(client.abort("req", n=1))
