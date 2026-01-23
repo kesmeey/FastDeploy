@@ -28,6 +28,7 @@ import pytest
 if not hasattr(paddle, "compat"):
     paddle.compat = SimpleNamespace(enable_torch_proxy=lambda **_: None)
 
+from fastdeploy.engine.request import RequestMetrics
 from fastdeploy.entrypoints.engine_client import EngineClient
 from fastdeploy.inter_communicator import (
     KVCacheStatus,
@@ -429,8 +430,16 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                             self.engine_client.data_processor.process_response = Mock()
 
                             # Mock metrics for tests that expect it
-                            mock_metrics = Mock()
+                            mock_metrics = RequestMetrics()
                             self.engine_client.request_metrics = mock_metrics
+
+                            # Create a mock task with metrics for tests that need it
+                            self.mock_task_with_metrics = {
+                                "request_id": "test-id",
+                                "prompt_token_ids": [1, 2, 3],
+                                "max_tokens": 100,
+                                "metrics": mock_metrics,
+                            }
 
     def test_max_logprobs_valid_values(self):
         """Test valid max_logprobs values"""
@@ -712,7 +721,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
             self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = False
-        task = {"multimodal_inputs": {"token_type_ids": [1, 2, 3]}}
+        task = {"metrics": RequestMetrics(), "multimodal_inputs": {"token_type_ids": [1, 2, 3]}}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -723,7 +732,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
             self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = True
-        task = {"multimodal_inputs": []}
+        task = {"metrics": RequestMetrics(), "multimodal_inputs": []}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -734,7 +743,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
             self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = True
-        task = {"multimodal_inputs": {"token_type_ids": [1, 0, 2]}}
+        task = {"metrics": RequestMetrics(), "multimodal_inputs": {"token_type_ids": [1, 0, 2]}}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -743,6 +752,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     async def test_add_requests_successful_processing(self):
         """Test successful request processing in add_requests."""
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "chat_template_kwargs": {"existing": "value"},
             "chat_template": "test_template",
@@ -764,7 +774,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_coroutine_processor(self):
         """Test add_requests with async processor."""
-        task = {"request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100}
+        task = {"metrics": RequestMetrics(), "request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100}
 
         async_mock = AsyncMock()
         self.engine_client.data_processor.process_request_dict = async_mock
@@ -781,6 +791,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.disable_prefix_mm = True
 
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "prompt_token_ids": [1, 2, 3],
             "multimodal_inputs": {"token_type_ids": [1, 0, 1]},
@@ -792,6 +803,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     async def test_add_requests_input_length_validation_error(self):
         """Test add_requests validation for input length."""
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "prompt_token_ids": list(range(1024)),
             "min_tokens": 1,
@@ -803,6 +815,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     async def test_add_requests_stop_sequences_validation(self):
         """Test add_requests validation for stop sequences."""
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "prompt_token_ids": [1, 2, 3],
             "stop_seqs_len": list(range(25)),  # Exceeds default limit
@@ -813,7 +826,13 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_n_parameter_multiple_requests(self):
         """Test add_requests with n parameter for multiple requests."""
-        task = {"request_id": "test-id_1", "prompt_token_ids": [1, 2, 3], "n": 3, "max_tokens": 100}
+        task = {
+            "metrics": RequestMetrics(),
+            "request_id": "test-id_1",
+            "prompt_token_ids": [1, 2, 3],
+            "n": 3,
+            "max_tokens": 100,
+        }
 
         with patch.object(self.engine_client, "_send_task") as mock_send:
             await self.engine_client.add_requests(task)
@@ -824,7 +843,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     def test_send_task_without_multimodal(self):
         """Test _send_task for non-multimodal content."""
         self.engine_client.enable_mm = False
-        task = {"test": "data"}
+        task = {"metrics": RequestMetrics(), "test": "data"}
 
         self.engine_client._send_task(task)
 
@@ -833,7 +852,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     def test_send_task_with_multimodal(self):
         """Test _send_task for multimodal content."""
         self.engine_client.enable_mm = True
-        task = {"test": "multimodal_data"}
+        task = {"metrics": RequestMetrics(), "test": "multimodal_data"}
 
         self.engine_client._send_task(task)
 
@@ -1482,6 +1501,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "multimodal_inputs": {"token_type_ids": [1, 1, 0, 1]},
@@ -1502,6 +1522,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3, 4, 5, 6, 7, 8],  # length = 8
@@ -1523,6 +1544,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3],
@@ -1546,6 +1568,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
+            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3],
