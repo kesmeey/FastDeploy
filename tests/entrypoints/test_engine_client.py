@@ -413,23 +413,24 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                             self.engine_client.prefix_tree_status_signal = Mock()
                             self.engine_client.prefix_tree_status_signal.value = np.array([0])
 
-                            # Set up data_processor with metrics attribute
+                            # Set up data_processor with proper mocking
+                            def mock_process_request_dict(task, max_model_len):
+                                # Simulate the real process_request_dict behavior
+                                task["prompt_token_ids_len"] = len(task["prompt_token_ids"])
+                                if "chat_template" in task:
+                                    chat_template_kwargs = task.get("chat_template_kwargs") or {}
+                                    chat_template_kwargs.update({"chat_template": task.get("chat_template")})
+                                    task["chat_template_kwargs"] = chat_template_kwargs
+                                if "messages" in task:
+                                    del task["messages"]
+
                             self.engine_client.data_processor = Mock()
-                            self.engine_client.data_processor.process_request_dict = Mock()
+                            self.engine_client.data_processor.process_request_dict = mock_process_request_dict
                             self.engine_client.data_processor.process_response = Mock()
 
                             # Mock metrics for tests that expect it
-
                             mock_metrics = Mock()
                             self.engine_client.request_metrics = mock_metrics
-
-                            # Create a mock task with metrics for tests that need it
-                            self.mock_task_with_metrics = {
-                                "request_id": "test-id",
-                                "prompt_token_ids": [1, 2, 3],
-                                "max_tokens": 100,
-                                "metrics": mock_metrics,
-                            }
 
     def test_max_logprobs_valid_values(self):
         """Test valid max_logprobs values"""
@@ -749,7 +750,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "max_tokens": 100,
             "min_tokens": 1,
             "messages": "test message",
-            "metrics": Mock(),
         }
 
         self.engine_client.data_processor.process_request_dict = Mock()
@@ -764,7 +764,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_coroutine_processor(self):
         """Test add_requests with async processor."""
-        task = {"request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100, "metrics": Mock()}
+        task = {"request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100}
 
         async_mock = AsyncMock()
         self.engine_client.data_processor.process_request_dict = async_mock
@@ -795,7 +795,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "request_id": "test-id",
             "prompt_token_ids": list(range(1024)),
             "min_tokens": 1,
-            "metrics": Mock(),
         }  # At max length
 
         with self.assertRaises(Exception):  # EngineError
@@ -807,7 +806,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "request_id": "test-id",
             "prompt_token_ids": [1, 2, 3],
             "stop_seqs_len": list(range(25)),  # Exceeds default limit
-            "metrics": Mock(),
         }
 
         with self.assertRaises(Exception):  # EngineError
@@ -815,7 +813,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_n_parameter_multiple_requests(self):
         """Test add_requests with n parameter for multiple requests."""
-        task = {"request_id": "test-id_1", "prompt_token_ids": [1, 2, 3], "n": 3, "max_tokens": 100, "metrics": Mock()}
+        task = {"request_id": "test-id_1", "prompt_token_ids": [1, 2, 3], "n": 3, "max_tokens": 100}
 
         with patch.object(self.engine_client, "_send_task") as mock_send:
             await self.engine_client.add_requests(task)
@@ -1192,6 +1190,9 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                 workers=1,
             )
 
+            # Ensure tensor_parallel_size is an integer
+            client.tensor_parallel_size = 16
+
         self.assertFalse(client.is_master)
 
     async def test_format_and_add_data(self):
@@ -1486,7 +1487,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "multimodal_inputs": {"token_type_ids": [1, 1, 0, 1]},
             "prompt_token_ids": [1, 2, 3],
             "max_tokens": 100,
-            "metrics": Mock(),
         }
 
         with self.assertRaises(EngineError) as context:
@@ -1507,7 +1507,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "prompt_token_ids": [1, 2, 3, 4, 5, 6, 7, 8],  # length = 8
             "max_tokens": 5,  # 8 + 5 = 13 >= 10
             "min_tokens": 2,
-            "metrics": Mock(),
         }
 
         with self.assertRaises(EngineError) as context:
@@ -1529,7 +1528,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "prompt_token_ids": [1, 2, 3],
             "max_tokens": 10,
             "stop_seqs_len": [10, 20, 30, 40],  # 4 sequences > limit of 3
-            "metrics": Mock(),
         }
 
         with self.assertRaises(EngineError) as context:
@@ -1553,7 +1551,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             "prompt_token_ids": [1, 2, 3],
             "max_tokens": 10,
             "stop_seqs_len": [3, 10, 2],  # 10 > limit of 5
-            "metrics": Mock(),
         }
 
         with self.assertRaises(EngineError) as context:
