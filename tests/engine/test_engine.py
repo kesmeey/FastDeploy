@@ -675,3 +675,232 @@ def test_check_health_worker_healthy(monkeypatch):
 
     assert healthy is True
     assert message == ""
+
+
+def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
+    """Test that cache manager starts in non-mixed mode for non-HPU platforms."""
+    cfg = build_cfg()
+    cfg.scheduler_config.splitwise_role = "prefill"  # Not mixed
+    cfg.parallel_config.device_ids = "0,1"
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.do_profile = 0
+    engine.ipc_signal_suffix = "test"
+
+    # Mock cache manager processes
+    mock_cache_processes = [DummyProcess(pid=123)]
+    mock_engine = SimpleNamespace(start_cache_service=lambda device_ids, suffix: mock_cache_processes)
+
+    monkeypatch.setattr(engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: False))
+    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
+    monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
+    monkeypatch.setattr(engine, "launch_components", lambda: None)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda x: None)
+
+    engine.launch()
+
+    assert engine.cache_manager_processes == mock_cache_processes
+
+
+def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
+    """Test that cache manager starts in mixed mode after profiling."""
+    cfg = build_cfg()
+    cfg.scheduler_config.splitwise_role = "mixed"
+    cfg.cache_config.enable_prefix_caching = True
+    cfg.parallel_config.device_ids = "0,1"
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.do_profile = 1  # Will trigger profiling
+    engine.ipc_signal_suffix = "test"
+
+    # Mock signals
+    engine.loaded_model_signal = SimpleNamespace(value=[1])
+    engine.launched_expert_service_signal = SimpleNamespace(value=[1])
+    engine.worker_ready_signal = SimpleNamespace(value=[1])
+
+    # Mock cache manager processes
+    mock_cache_processes = [DummyProcess(pid=789)]
+    mock_engine = SimpleNamespace(
+        start_cache_service=lambda device_ids, suffix: mock_cache_processes,
+        scheduler=SimpleNamespace(start=lambda *args: None),
+    )
+
+    monkeypatch.setattr(engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: False))
+    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
+    monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
+    monkeypatch.setattr(engine, "_stop_profile", lambda: None)
+    monkeypatch.setattr(envs, "FD_ENABLE_MULTI_API_SERVER", False, raising=False)
+    monkeypatch.setattr(envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False, raising=False)
+    monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: DummyQueueServer())
+    monkeypatch.setattr(engine_module, "start_data_parallel_service", lambda *args: None)
+    monkeypatch.setattr(engine_module.multiprocessing, "Queue", lambda: object())
+    monkeypatch.setattr(
+        engine_module.multiprocessing,
+        "get_context",
+        lambda name: SimpleNamespace(Process=lambda *args, **kwargs: DummyProcess(pid=500)),
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+
+    engine.launch()
+
+    assert engine.cache_manager_processes == mock_cache_processes
+
+
+def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
+    """Test that cache manager signal is set in non-mixed mode."""
+    cfg = build_cfg()
+    cfg.scheduler_config.splitwise_role = "prefill"  # Not mixed
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.do_profile = 0
+    engine.ipc_signal_suffix = "test"
+
+    # Mock signals
+    engine.launched_cache_manager_signal = SimpleNamespace(value=[0])
+
+    mock_engine = SimpleNamespace(start_cache_service=lambda device_ids, suffix: [])
+
+    monkeypatch.setattr(
+        engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: True)
+    )  # Skip cache manager
+    monkeypatch.setattr(engine, "engine", mock_engine)
+    monkeypatch.setattr(engine, "_start_worker_service", lambda: DummyProcess(pid=456))
+    monkeypatch.setattr(engine, "_init_worker_signals", lambda: None)
+    monkeypatch.setattr(engine, "_wait_for_workers_ready", lambda: None)
+    monkeypatch.setattr(envs, "FD_ENABLE_MULTI_API_SERVER", False, raising=False)
+    monkeypatch.setattr(envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False, raising=False)
+    monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: DummyQueueServer())
+    monkeypatch.setattr(engine_module, "start_data_parallel_service", lambda *args: None)
+    monkeypatch.setattr(engine_module.multiprocessing, "Queue", lambda: object())
+    monkeypatch.setattr(
+        engine_module.multiprocessing,
+        "get_context",
+        lambda name: SimpleNamespace(Process=lambda *args, **kwargs: DummyProcess(pid=500)),
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+
+    engine.launch()
+
+    assert engine.launched_cache_manager_signal.value[0] == 1
+
+
+def test_worker_init_check_failure_path(monkeypatch):
+    """Test worker initialization check failure path."""
+    cfg = build_cfg()
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.worker_init_status = {}
+
+    # Create a mock process that will "fail" during polling
+    class FailingProcess:
+        def __init__(self):
+            self.stdout = [b"Loading checkpoint shards: 50"]
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            return 1 if self.poll_count > 2 else None  # Fail after a few polls
+
+    engine.worker_proc = FailingProcess()
+    engine._worker_processes_ready = lambda: True
+
+    class DummyTqdm:
+        def __init__(self, total, desc):
+            self.n = 0
+
+        def update(self, delta):
+            self.n += delta
+
+        def refresh(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(engine_module, "tqdm", DummyTqdm)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+
+    result = engine.check_worker_initialize_status()
+
+    assert result is False
+
+
+def test_generate_processes_stream_results(monkeypatch):
+    """Test generate method processes streaming results."""
+    cfg = build_cfg()
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.data_processor = DummyDataProcessor()
+    engine.engine = SimpleNamespace(
+        data_processor=engine.data_processor,
+        check_and_free_block_tables=lambda: None,
+    )
+
+    engine._format_and_add_data = lambda prompts: "req"
+    engine._get_generated_tokens = lambda req_id: [
+        DummyResult(False),  # Streaming result
+        DummyResult(True),  # Final result
+    ]
+
+    # Mock process_response to return None for streaming, result for final
+    def mock_process_response(result):
+        if not result.finished:
+            return None  # Skip streaming results
+        return result
+
+    monkeypatch.setattr(engine.data_processor, "process_response", mock_process_response)
+
+    outputs = list(engine.generate({"prompt": "hi"}, stream=True))
+
+    # Should only get the final result since streaming returns None
+    assert len(outputs) == 1
+    assert outputs[0]["outputs"]["text"] == "ok"
+
+
+def test_launch_components_logs_tensor_parallel_info(monkeypatch):
+    """Test that launch_components logs tensor parallel information."""
+    cfg = build_cfg()
+    cfg.scheduler_config.name = "dp"
+    cfg.parallel_config.data_parallel_size = 2
+    cfg.nnode = 1
+    cfg.parallel_config.tensor_parallel_size = 2
+    cfg.parallel_config.engine_worker_queue_port = [1000, 1001]
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.cfg = cfg
+    engine.engine = SimpleNamespace(
+        split_connector=SimpleNamespace(start_receiver=lambda: None),
+        scheduler=DummyScheduler(),
+    )
+    engine.launched_expert_service_signal = SimpleNamespace(value=[1, 1])
+
+    # Mock logging to capture messages
+    logged_messages = []
+
+    def mock_info(msg):
+        logged_messages.append(msg)
+
+    monkeypatch.setattr(engine_module.llm_logger, "info", mock_info)
+    monkeypatch.setattr(envs, "FD_ENABLE_MULTI_API_SERVER", False, raising=False)
+    monkeypatch.setattr(envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False, raising=False)
+    monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: DummyQueueServer())
+    monkeypatch.setattr(engine_module, "start_data_parallel_service", lambda *args: None)
+    monkeypatch.setattr(engine_module.multiprocessing, "Queue", lambda: object())
+    monkeypatch.setattr(
+        engine_module.multiprocessing,
+        "get_context",
+        lambda name: SimpleNamespace(Process=lambda *args, **kwargs: DummyProcess(pid=500)),
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda seconds: None)
+
+    engine.launch_components()
+
+    # Check that tensor parallel info was logged
+    tensor_parallel_logs = [msg for msg in logged_messages if "tensor_parallel_size" in msg]
+    assert len(tensor_parallel_logs) > 0
