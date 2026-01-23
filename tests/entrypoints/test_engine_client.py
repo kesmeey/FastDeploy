@@ -14,7 +14,6 @@
 # limitations under the License.
 """
 
-import asyncio
 import os
 import time
 import unittest
@@ -22,13 +21,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import numpy as np
-import paddle
 import pytest
 
-if not hasattr(paddle, "compat"):
-    paddle.compat = SimpleNamespace(enable_torch_proxy=lambda **_: None)
-
-from fastdeploy.engine.request import RequestMetrics
 from fastdeploy.entrypoints.engine_client import EngineClient
 from fastdeploy.inter_communicator import (
     KVCacheStatus,
@@ -308,7 +302,7 @@ class TestEngineClient(unittest.IsolatedAsyncioTestCase):
         # assert request["chat_template_kwargs"]["tools"] == [1]
 
 
-class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
+class TestEngineClientValidParameters(unittest.TestCase):
     """Test cases for EngineClient.valid_parameters method"""
 
     def setUp(self):
@@ -334,33 +328,21 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         mock_config.parallel_config.tensor_parallel_rank = 0
         mock_config.parallel_config.local_data_parallel_id = 0
         mock_config.parallel_config.tensor_parallel_size = 1  # Add this missing attribute
-        mock_config.parallel_config.device_ids = "0"
         mock_config.scheduler_config = MagicMock()
         mock_config.scheduler_config.splitwise_role = None
         mock_config.cache_config = MagicMock()  # Add cache_config
         mock_config.cache_config.enable_prefix_caching = False
         mock_config.cache_config.max_processor_cache = 0
         mock_config.cache_config.swap_space = False  # Critical: must be False for update/clear tests
-        mock_config.cache_config.enable_cache_transfer = False
         mock_config.limit_mm_per_prompt = 5  # Add this attribute
         mock_config.mm_processor_kwargs = {}  # Add this attribute
         mock_config.structured_outputs_config = MagicMock()  # Add this
         mock_config.structured_outputs_config.reasoning_parser = None
-        mock_config.structured_outputs_config.logits_processors = None
         mock_config.tool_parser = None  # Add this attribute
-        mock_config.master_ip = "127.0.0.1"
-        mock_config.host_ip = "127.0.0.1"
 
         # Mock IPCSignal to avoid file system dependencies
         with patch("fastdeploy.entrypoints.engine_client.IPCSignal") as mock_ipcsignal:
             mock_ipcsignal.return_value = MagicMock()
-
-            metrics_patch = patch("fastdeploy.entrypoints.engine_client.main_process_metrics")
-            mock_metrics = metrics_patch.start()
-            self.addCleanup(metrics_patch.stop)
-            mock_metrics.request_params_max_tokens.observe = Mock()
-            mock_metrics.prompt_tokens_total.inc = Mock()
-            mock_metrics.request_prompt_tokens.observe = Mock()
 
             with patch("fastdeploy.entrypoints.engine_client.StatefulSemaphore") as mock_semaphore:
                 mock_semaphore.return_value = MagicMock()
@@ -384,9 +366,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                                 workers=1,
                             )
 
-                            # Override tensor_parallel_size to ensure it's an int
-                            self.engine_client.tensor_parallel_size = 1
-
                             # Set up mock attributes for TestEngineClientValidParameters class
                             self.engine_client.zmq_client = Mock()
                             self.engine_client.zmq_client.send_json = Mock()
@@ -401,6 +380,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                             self.engine_client.enable_mm = False
                             self.engine_client.config = mock_config
                             self.engine_client.max_chips_per_node = 8
+                            self.engine_client.tensor_parallel_size = 1
                             self.engine_client.is_master = True
                             self.engine_client.worker_healthy_live_signal = Mock()
                             self.engine_client.worker_healthy_live_signal.value = np.array([0])
@@ -413,33 +393,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                             self.engine_client.kv_cache_status_signal.value = np.array([0])
                             self.engine_client.prefix_tree_status_signal = Mock()
                             self.engine_client.prefix_tree_status_signal.value = np.array([0])
-
-                            # Set up data_processor with proper mocking
-                            def mock_process_request_dict(task, max_model_len):
-                                # Simulate the real process_request_dict behavior
-                                task["prompt_token_ids_len"] = len(task["prompt_token_ids"])
-                                if "chat_template" in task:
-                                    chat_template_kwargs = task.get("chat_template_kwargs") or {}
-                                    chat_template_kwargs.update({"chat_template": task.get("chat_template")})
-                                    task["chat_template_kwargs"] = chat_template_kwargs
-                                if "messages" in task:
-                                    del task["messages"]
-
-                            self.engine_client.data_processor = Mock()
-                            self.engine_client.data_processor.process_request_dict = mock_process_request_dict
-                            self.engine_client.data_processor.process_response = Mock()
-
-                            # Mock metrics for tests that expect it
-                            mock_metrics = RequestMetrics()
-                            self.engine_client.request_metrics = mock_metrics
-
-                            # Create a mock task with metrics for tests that need it
-                            self.mock_task_with_metrics = {
-                                "request_id": "test-id",
-                                "prompt_token_ids": [1, 2, 3],
-                                "max_tokens": 100,
-                                "metrics": mock_metrics,
-                            }
 
     def test_max_logprobs_valid_values(self):
         """Test valid max_logprobs values"""
@@ -627,7 +580,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         # Create mocks for all the external dependencies
         mock_input_processor = Mock()
         mock_processor = Mock()
-        mock_processor.tokenizer = create_mock_tokenizer()
         mock_input_processor.create_processor.return_value = mock_processor
 
         # Mock current platform
@@ -718,10 +670,8 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_check_mm_disable_prefix_cache_with_disabled_cache(self):
         """Test _check_mm_disable_prefix_cache when prefix cache is disabled."""
-        if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
-            self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = False
-        task = {"metrics": RequestMetrics(), "multimodal_inputs": {"token_type_ids": [1, 2, 3]}}
+        task = {"multimodal_inputs": {"token_type_ids": [1, 2, 3]}}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -729,10 +679,8 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_check_mm_disable_prefix_cache_with_no_multimodal_data(self):
         """Test _check_mm_disable_prefix_cache with no multimodal inputs."""
-        if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
-            self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = True
-        task = {"metrics": RequestMetrics(), "multimodal_inputs": []}
+        task = {"multimodal_inputs": []}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -740,10 +688,8 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_check_mm_disable_prefix_cache_with_multimodal_data(self):
         """Test _check_mm_disable_prefix_cache detects multimodal data."""
-        if not hasattr(self.engine_client, "_check_mm_disable_prefix_cache"):
-            self.skipTest("EngineClient lacks _check_mm_disable_prefix_cache")
         self.engine_client.disable_prefix_mm = True
-        task = {"metrics": RequestMetrics(), "multimodal_inputs": {"token_type_ids": [1, 0, 2]}}
+        task = {"multimodal_inputs": {"token_type_ids": [1, 0, 2]}}
 
         result = self.engine_client._check_mm_disable_prefix_cache(task)
 
@@ -752,7 +698,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     async def test_add_requests_successful_processing(self):
         """Test successful request processing in add_requests."""
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "chat_template_kwargs": {"existing": "value"},
             "chat_template": "test_template",
@@ -774,7 +719,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_coroutine_processor(self):
         """Test add_requests with async processor."""
-        task = {"metrics": RequestMetrics(), "request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100}
+        task = {"request_id": "test-id", "prompt_token_ids": [1, 2, 3], "max_tokens": 100}
 
         async_mock = AsyncMock()
         self.engine_client.data_processor.process_request_dict = async_mock
@@ -791,7 +736,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.disable_prefix_mm = True
 
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "prompt_token_ids": [1, 2, 3],
             "multimodal_inputs": {"token_type_ids": [1, 0, 1]},
@@ -802,12 +746,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_input_length_validation_error(self):
         """Test add_requests validation for input length."""
-        task = {
-            "metrics": RequestMetrics(),
-            "request_id": "test-id",
-            "prompt_token_ids": list(range(1024)),
-            "min_tokens": 1,
-        }  # At max length
+        task = {"request_id": "test-id", "prompt_token_ids": list(range(1024)), "min_tokens": 1}  # At max length
 
         with self.assertRaises(Exception):  # EngineError
             await self.engine_client.add_requests(task)
@@ -815,7 +754,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     async def test_add_requests_stop_sequences_validation(self):
         """Test add_requests validation for stop sequences."""
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test-id",
             "prompt_token_ids": [1, 2, 3],
             "stop_seqs_len": list(range(25)),  # Exceeds default limit
@@ -826,13 +764,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_requests_with_n_parameter_multiple_requests(self):
         """Test add_requests with n parameter for multiple requests."""
-        task = {
-            "metrics": RequestMetrics(),
-            "request_id": "test-id_1",
-            "prompt_token_ids": [1, 2, 3],
-            "n": 3,
-            "max_tokens": 100,
-        }
+        task = {"request_id": "test-id_1", "prompt_token_ids": [1, 2, 3], "n": 3, "max_tokens": 100}
 
         with patch.object(self.engine_client, "_send_task") as mock_send:
             await self.engine_client.add_requests(task)
@@ -843,7 +775,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     def test_send_task_without_multimodal(self):
         """Test _send_task for non-multimodal content."""
         self.engine_client.enable_mm = False
-        task = {"metrics": RequestMetrics(), "test": "data"}
+        task = {"test": "data"}
 
         self.engine_client._send_task(task)
 
@@ -852,7 +784,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
     def test_send_task_with_multimodal(self):
         """Test _send_task for multimodal content."""
         self.engine_client.enable_mm = True
-        task = {"metrics": RequestMetrics(), "test": "multimodal_data"}
+        task = {"test": "multimodal_data"}
 
         self.engine_client._send_task(task)
 
@@ -1122,12 +1054,12 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             patch("fastdeploy.entrypoints.engine_client.IPCSignal") as mock_ipcsignal,
             patch("fastdeploy.entrypoints.engine_client.envs") as mock_envs,
             patch("os.getenv", return_value="50"),
+            patch("fastdeploy.cache_manager.cache_data.is_mm_model_disable_prefix_cache", return_value=True),
         ):
             mock_platform.is_iluvatar.return_value = False
             mock_input_processor = Mock()
             mock_processor_class.return_value = mock_input_processor
             mock_processor = Mock()
-            mock_processor.tokenizer = create_mock_tokenizer()
             mock_input_processor.create_processor.return_value = mock_processor
 
             mock_signal_instance = Mock()
@@ -1157,6 +1089,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(client.enable_mm)
         self.assertTrue(client.enable_prefix_caching)
+        self.assertTrue(client.disable_prefix_mm)
 
     async def test_init_as_worker_node(self):
         """Test EngineClient initialization as worker node (not master)."""
@@ -1180,7 +1113,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             mock_input_processor = Mock()
             mock_processor_class.return_value = mock_input_processor
             mock_processor = Mock()
-            mock_processor.tokenizer = create_mock_tokenizer()
             mock_input_processor.create_processor.return_value = mock_processor
 
             mock_signal_instance = Mock()
@@ -1208,9 +1140,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
                 fd_config=mock_config,
                 workers=1,
             )
-
-            # Ensure tensor_parallel_size is an integer
-            client.tensor_parallel_size = 16
 
         self.assertFalse(client.is_master)
 
@@ -1244,7 +1173,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         mock_config.parallel_config = mock_parallel_config
 
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
 
         # Set up mock arrays
         mock_local_stats = Mock()
@@ -1292,7 +1220,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         mock_config.parallel_config = mock_parallel_config
 
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
         self.engine_client.rearrange_experts_signal = Mock()
         self.engine_client.rearrange_experts_signal.value = np.array([RearrangeExpertStatus.FREE.value])
 
@@ -1350,7 +1277,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         mock_config.parallel_config = mock_parallel_config
 
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
+        self.engine_client.fd_config = mock_config  # Also set fd_config for proper access
         self.engine_client.tensor_parallel_size = 4  # Set this to match the config
 
         with patch("fastdeploy.entrypoints.engine_client.IPCSignal") as mock_ipcsignal:
@@ -1401,8 +1328,8 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         mock_config.parallel_config = mock_parallel_config
 
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
         self.engine_client.tensor_parallel_size = 2  # Set this to match mock_parallel_config.tensor_parallel_size
+        self.engine_client.fd_config = mock_config  # Also set fd_config to ensure proper access
 
         with patch("fastdeploy.entrypoints.engine_client.IPCSignal") as mock_ipcsignal:
             mock_signal = Mock()
@@ -1462,7 +1389,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             mock_input_processor = Mock()
             mock_processor_class.return_value = mock_input_processor
             mock_processor = Mock()
-            mock_processor.tokenizer = create_mock_tokenizer()
             mock_input_processor.create_processor.return_value = mock_processor
 
             mock_signal_instance = Mock()
@@ -1493,7 +1419,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.is_master)  # With 1 tensor_parallel_size, should be master even on Iluvatar
 
     async def test_add_requests_multimodal_prefix_cache_error(self):
-        """Test add_requests rejects malformed request id suffixes."""
+        """Test add_requests with multimodal data when prefix cache is enabled."""
         self.engine_client.enable_mm = True
         self.engine_client.enable_prefix_caching = True
         self.engine_client.disable_prefix_mm = True
@@ -1501,10 +1427,9 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
-            "multimodal_inputs": {"token_type_ids": [1, 1, 0, 1]},
+            "multimodal_inputs": {"token_type_ids": [1, 1, 0, 1]},  # Multimodal data present
             "prompt_token_ids": [1, 2, 3],
             "max_tokens": 100,
         }
@@ -1512,7 +1437,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(EngineError) as context:
             await self.engine_client.add_requests(task)
 
-        self.assertIn("invalid literal for int()", str(context.exception))
+        self.assertIn("does not support processing requests containing multimodal data", str(context.exception))
         self.assertEqual(context.exception.error_code, 400)
 
     async def test_add_requests_input_too_long_error(self):
@@ -1522,7 +1447,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3, 4, 5, 6, 7, 8],  # length = 8
@@ -1544,7 +1468,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3],
@@ -1568,7 +1491,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.data_processor.process_request_dict = Mock()
 
         task = {
-            "metrics": RequestMetrics(),
             "request_id": "test_request",
             "user": "test_user",
             "prompt_token_ids": [1, 2, 3],
@@ -1616,7 +1538,7 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.engine_client.config = mock_config
         self.engine_client.fd_config = mock_config
         self.engine_client.rearrange_experts_signal = Mock(value=np.array([2]))
-        self.engine_client.expert_tokens_stats_array_list = [Mock(value=np.zeros((2, 3), dtype=np.int32))]
+        self.engine_client.expert_tokens_stats_array_list = [Mock(value=np.array([0]))]
         self.engine_client.signal_update_weight_from_disk_array_list = [Mock(value=np.array([0]))]
 
         content, status_code = await self.engine_client.rearrange_experts(
@@ -1714,8 +1636,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         """Test get_per_expert_tokens_stats with invalid credentials."""
         mock_config = create_mock_fd_config(enable_eplb=True)
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.fd_config = mock_config
 
         content, status_code = await self.engine_client.get_per_expert_tokens_stats(
             {"user": "wrong_user", "passwd": "wrong_pass"}
@@ -1728,7 +1648,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         """Test check_redundant with invalid credentials."""
         mock_config = create_mock_fd_config(enable_eplb=True)
         self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
 
         content, status_code = await self.engine_client.check_redundant({"user": "wrong_user", "passwd": "wrong_pass"})
 
@@ -1747,238 +1666,6 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("ZMQ send failed", str(context.exception))
-
-    async def test_rearrange_experts_missing_ips(self):
-        """Test rearrange_experts with missing ips field."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": ""}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertEqual(content["msg"], "ips in request is None")
-        self.assertEqual(status_code, 400)
-
-    async def test_rearrange_experts_non_zero_rank(self):
-        """Test rearrange_experts rejects non-zero tensor parallel rank."""
-        mock_config = create_mock_fd_config(enable_eplb=True, tensor_parallel_rank=1)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": ""}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertIn("expect rank 0", content["msg"])
-        self.assertEqual(status_code, 400)
-
-    async def test_rearrange_experts_invalid_data_for_recv_expert_weight(self):
-        """Test rearrange_experts recv_expert_weight with invalid data."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "recv_expert_weight", "data": "bad"}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertIn("data is not a list", content["msg"])
-        self.assertEqual(status_code, 400)
-
-    async def test_rearrange_experts_update_weight_from_tensor_wrong_role(self):
-        """Test rearrange_experts update_weight_from_tensor with wrong role."""
-        mock_config = create_mock_fd_config(enable_eplb=True, splitwise_role="decode")
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.LOAD_SUCC.value]))
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "update_weight_from_tensor"}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertIn("expect role prefill", content["msg"])
-        self.assertEqual(status_code, 400)
-
-    async def test_rearrange_experts_update_weight_from_tensor_wrong_status(self):
-        """Test rearrange_experts update_weight_from_tensor with wrong status."""
-        mock_config = create_mock_fd_config(enable_eplb=True, splitwise_role="prefill")
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([RearrangeExpertStatus.FREE.value]))
-
-        content, status_code = await self.engine_client.rearrange_experts(
-            {"user": "test_user", "passwd": "test_pass", "action": "update_weight_from_tensor"}
-        )
-
-        self.assertEqual(content["code"], 1)
-        self.assertIn("expect status", content["msg"])
-        self.assertEqual(status_code, 400)
-
-    async def test_get_per_expert_tokens_stats_clear_stat(self):
-        """Test get_per_expert_tokens_stats with clear_stat sets signals."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-
-        self.engine_client.signal_clear_experts_token_stats_list = [Mock(value=np.array([0]))]
-        self.engine_client.local_experts_token_stats_array_list = [Mock(value=np.array([2, 4]))]
-
-        content, status_code = await self.engine_client.get_per_expert_tokens_stats(
-            {"user": "test_user", "passwd": "test_pass", "clear_stat": True}
-        )
-
-        self.assertEqual(content["code"], 0)
-        self.assertEqual(content["data"], [[2, 4]])
-        self.assertEqual(self.engine_client.signal_clear_experts_token_stats_list[0].value[0], 1)
-        self.assertEqual(status_code, 200)
-
-    async def test_check_redundant_unknown_status_with_workloads(self):
-        """Test check_redundant handles unknown status and workload loading."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.rearrange_experts_signal = Mock(value=np.array([999]))
-
-        with patch("fastdeploy.entrypoints.engine_client.RedundantExpertWorkload") as mock_workload:
-            mock_workload.return_value.load.return_value = ({"w": 1}, "loaded")
-            content, status_code = await self.engine_client.check_redundant(
-                {"user": "test_user", "passwd": "test_pass", "check_get_workloads": True}
-            )
-
-        self.assertEqual(content["status"], "unknown")
-        self.assertEqual(content["data"], {"w": 1})
-        self.assertEqual(content["msg"], "loaded")
-        self.assertEqual(status_code, 200)
-
-    async def test_check_redundant_check_load_weight_result(self):
-        """Test check_redundant returns update weight results."""
-        mock_config = create_mock_fd_config(enable_eplb=True)
-        self.engine_client.config = mock_config
-        self.engine_client.fd_config = mock_config
-        self.engine_client.update_weight_from_disk_result_list = [
-            Mock(value=np.array([1])),
-            Mock(value=np.array([0])),
-        ]
-
-        content, status_code = await self.engine_client.check_redundant(
-            {"user": "test_user", "passwd": "test_pass", "action": "check_load_weight_result"}
-        )
-
-        self.assertEqual(content["data"], [1, 0])
-        self.assertEqual(content["code"], 0)
-        self.assertEqual(status_code, 200)
-
-    def test_update_model_weight_with_cache_transfer(self):
-        """Test update_model_weight with cache transfer enabled."""
-        self.engine_client.enable_cache_transfer = True
-        self.engine_client.enable_prefix_caching = False
-        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.CLEARED])
-        self.engine_client.kv_cache_status_signal.value = np.array([KVCacheStatus.NORMAL])
-
-        def fake_sleep(_):
-            self.engine_client.model_weights_status_signal.value[0] = ModelWeightsStatus.NORMAL
-
-        with patch("time.sleep", side_effect=fake_sleep):
-            result, message = self.engine_client.update_model_weight(timeout=1)
-
-        self.assertTrue(result)
-        self.assertEqual(message, "")
-
-    def test_clear_load_weight_with_cache_transfer(self):
-        """Test clear_load_weight with cache transfer enabled."""
-        self.engine_client.enable_cache_transfer = True
-        self.engine_client.enable_prefix_caching = False
-        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.NORMAL])
-        self.engine_client.kv_cache_status_signal.value = np.array([KVCacheStatus.CLEARED])
-
-        def fake_sleep(_):
-            self.engine_client.model_weights_status_signal.value[0] = ModelWeightsStatus.CLEARED
-
-        with patch("time.sleep", side_effect=fake_sleep):
-            result, message = self.engine_client.clear_load_weight(timeout=1)
-
-        self.assertTrue(result)
-        # Accept any successful message
-        self.assertIsInstance(message, str)
-
-    def test_prefix_tree_update_and_clear_paths(self):
-        """Test prefix tree update/clear paths with prefix caching enabled."""
-        self.engine_client.enable_prefix_caching = True
-        self.engine_client.enable_cache_transfer = False
-        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.NORMAL])
-        self.engine_client.prefix_tree_status_signal.value = np.array([PrefixTreeStatus.CLEARED])
-
-        def fake_sleep_update(_):
-            self.engine_client.prefix_tree_status_signal.value[0] = PrefixTreeStatus.NORMAL
-
-        with patch("time.sleep", side_effect=fake_sleep_update):
-            result, message = self.engine_client.update_model_weight(timeout=1)
-
-        self.assertTrue(result)
-        # Accept any successful message
-        self.assertIsInstance(message, str)
-
-        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.CLEARED])
-        self.engine_client.prefix_tree_status_signal.value = np.array([PrefixTreeStatus.NORMAL])
-
-        def fake_sleep_clear(_):
-            self.engine_client.prefix_tree_status_signal.value[0] = PrefixTreeStatus.CLEARED
-
-        with patch("time.sleep", side_effect=fake_sleep_clear):
-            result, message = self.engine_client.clear_load_weight(timeout=1)
-
-        self.assertTrue(result)
-        # Accept any successful message
-        self.assertIsInstance(message, str)
-
-    def test_abort_with_request_suffix_and_disconnect_flag(self):
-        """Test abort sends requests with suffix when disconnect flag is enabled."""
-        self.engine_client.enable_mm = True
-        self.engine_client.zmq_client = Mock()
-        self.engine_client.zmq_client.send_pyobj = Mock()
-
-        task = SimpleNamespace(multimodal_inputs={"images": np.array([1, 2, 3])})
-        with patch("fastdeploy.entrypoints.engine_client.envs.FD_ENABLE_E2W_TENSOR_CONVERT", True):
-            self.engine_client._send_task(task)
-
-        self.assertIsInstance(task.multimodal_inputs["images"], paddle.Tensor)
-
-        with patch("fastdeploy.entrypoints.engine_client.envs.FD_ENABLE_REQUEST_DISCONNECT_STOP_INFERENCE", True):
-            asyncio.run(self.engine_client.abort("request_2", n=2))
-
-        sent_ids = [
-            call.args[0]["request_id"]
-            for call in self.engine_client.zmq_client.send_pyobj.call_args_list
-            if isinstance(call.args[0], dict)
-        ]
-        self.assertEqual(sent_ids[-2:], ["request_0", "request_1"])
-
-    def test_abort_with_non_positive_n(self):
-        """Test abort early return on non-positive n."""
-        self.engine_client.zmq_client = Mock()
-        self.engine_client.zmq_client.send_json = Mock()
-
-        with patch("fastdeploy.entrypoints.engine_client.envs.FD_ENABLE_REQUEST_DISCONNECT_STOP_INFERENCE", True):
-            asyncio.run(self.engine_client.abort("request_1", n=0))
-
-        self.engine_client.zmq_client.send_json.assert_not_called()
-
-    def test_abort_without_suffix(self):
-        """Test abort handles request ids without numeric suffix."""
-        self.engine_client.zmq_client = Mock()
-        self.engine_client.zmq_client.send_json = Mock()
-
-        with patch("fastdeploy.entrypoints.engine_client.envs.FD_ENABLE_REQUEST_DISCONNECT_STOP_INFERENCE", True):
-            asyncio.run(self.engine_client.abort("request", n=1))
-
-        self.engine_client.zmq_client.send_json.assert_called_once()
 
 
 if __name__ == "__main__":
