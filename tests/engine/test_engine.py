@@ -688,6 +688,7 @@ def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
     engine._wait_for_workers_ready = lambda: None
+    engine.is_started = False
 
     # Mock cache manager processes
     mock_cache_processes = [DummyProcess(pid=123)]
@@ -718,6 +719,7 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
     engine._wait_for_workers_ready = lambda: None
+    engine.is_started = False
 
     # Mock signals
     engine.loaded_model_signal = SimpleNamespace(value=[1])
@@ -764,6 +766,7 @@ def test_launch_non_mixed_mode_sets_cache_manager_signal(monkeypatch):
     engine.ipc_signal_suffix = "test"
     engine.engine = SimpleNamespace()
     engine._wait_for_workers_ready = lambda: None
+    engine.is_started = False
 
     # Mock signals
     engine.launched_cache_manager_signal = SimpleNamespace(value=[0])
