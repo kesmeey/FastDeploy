@@ -475,6 +475,43 @@ class CacheTransferManager:
 
     def _run_read_storage(
         self,
+        *args,
+        **kwargs,
+    ):
+        """
+        Read storage data from the given blocks to the corresponding cache tensors on the current rank's GPU.
+        """
+        if args and isinstance(args[0], list):
+            k_cache_keys = args[0]
+            v_cache_keys = args[1] if len(args) > 1 else kwargs.get("v_cache_keys", [])
+            gpu_block_ids = args[2] if len(args) > 2 else kwargs.get("gpu_block_ids")
+            cpu_block_ids = args[3] if len(args) > 3 else kwargs.get("cpu_block_ids")
+            task_id = kwargs.get("task_id")
+            token_ids = kwargs.get("token_ids", [])
+            start_read_block_idx = kwargs.get("start_read_block_idx", 0)
+            timeout = kwargs.get("timeout", 30.0)
+        else:
+            task_id = args[0] if len(args) > 0 else kwargs.get("task_id")
+            token_ids = args[1] if len(args) > 1 else kwargs.get("token_ids", [])
+            start_read_block_idx = args[2] if len(args) > 2 else kwargs.get("start_read_block_idx", 0)
+            k_cache_keys = args[3] if len(args) > 3 else kwargs.get("k_cache_keys", [])
+            v_cache_keys = args[4] if len(args) > 4 else kwargs.get("v_cache_keys", [])
+            gpu_block_ids = args[5] if len(args) > 5 else kwargs.get("gpu_block_ids")
+            cpu_block_ids = args[6] if len(args) > 6 else kwargs.get("cpu_block_ids")
+            timeout = args[7] if len(args) > 7 else kwargs.get("timeout", 30.0)
+        return self._run_read_storage_impl(
+            task_id=task_id,
+            token_ids=token_ids,
+            start_read_block_idx=start_read_block_idx,
+            k_cache_keys=k_cache_keys,
+            v_cache_keys=v_cache_keys,
+            gpu_block_ids=gpu_block_ids,
+            cpu_block_ids=cpu_block_ids,
+            timeout=timeout,
+        )
+
+    def _run_read_storage_impl(
+        self,
         task_id: str,
         token_ids: List[int],
         start_read_block_idx: int,
@@ -484,62 +521,8 @@ class CacheTransferManager:
         cpu_block_ids: List[int],
         timeout: float,
     ):
-        """
-        Read storage data from the given blocks to the corresponding cache tensors on the current rank's GPU.
-        """
         try:
-            if self.storage_backend_type == "mooncake":
-                block_num = len(gpu_block_ids)
-                keys = k_cache_keys + v_cache_keys
-                k_cache_ptrs = [
-                    self.storage_key_read_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
-                ]
-                v_cache_ptrs = [
-                    self.storage_value_read_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
-                ]
-                kv_cache_ptrs = k_cache_ptrs + v_cache_ptrs
-                kv_block_sizes = [self.storage_buffer_stride_bytes] * block_num * 2  # key and value
-                start_time = time.time()
-                result = self.storage_backend.batch_get(
-                    keys, target_locations=kv_cache_ptrs, target_sizes=kv_block_sizes
-                )
-                read_cost_time = time.time() - start_time
-
-                k_result, v_result = result[:block_num], result[block_num:]
-                success_block_num = 0
-                for k, v in zip(k_result, v_result):
-                    if k > 0 and v > 0:
-                        success_block_num += 1
-                logger.debug(f"_run_read_storage, success_block_num: {success_block_num}")
-                valid_gpu_block_ids = gpu_block_ids[:success_block_num]
-                valid_cpu_block_ids = cpu_block_ids[:success_block_num]
-
-                mode = 1  # cpu ==> gpu
-                start_time = time.time()
-                swap_cache_layout(
-                    self.gpu_cache_k_tensors,
-                    self.storage_key_read_buffer,
-                    self.key_cache_shape,
-                    valid_gpu_block_ids,
-                    valid_cpu_block_ids,
-                    self.device,
-                    mode,
-                )
-                swap_cache_layout(
-                    self.gpu_cache_v_tensors,
-                    self.storage_value_read_buffer,
-                    self.value_cache_shape,
-                    valid_gpu_block_ids,
-                    valid_cpu_block_ids,
-                    self.device,
-                    mode,
-                )
-                swap_cost_time = time.time() - start_time
-                logger.debug(
-                    f"_run_read_storage, swap_cost_time: {swap_cost_time:.6f}s, read_cost_time: {read_cost_time:.6f}s"
-                )
-
-            elif self.storage_backend_type == "attention_store":
+            if self.storage_backend_type == "attention_store":
                 key_cache = []
                 val_cache = []
                 for i in range(self.num_layers + self.num_extra_layers):
@@ -553,6 +536,55 @@ class CacheTransferManager:
                 read_cost_time = time.time() - start_time
                 valid_gpu_block_ids = gpu_block_ids[:read_block_num]
                 logger.debug(f"_run_read_storage, read_cost_time: {read_cost_time:.6f}s")
+                return valid_gpu_block_ids
+
+            block_num = len(gpu_block_ids)
+            keys = k_cache_keys + v_cache_keys
+            k_cache_ptrs = [
+                self.storage_key_read_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
+            ]
+            v_cache_ptrs = [
+                self.storage_value_read_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
+            ]
+            kv_cache_ptrs = k_cache_ptrs + v_cache_ptrs
+            kv_block_sizes = [self.storage_buffer_stride_bytes] * block_num * 2  # key and value
+            start_time = time.time()
+            result = self.storage_backend.batch_get(keys, target_locations=kv_cache_ptrs, target_sizes=kv_block_sizes)
+            read_cost_time = time.time() - start_time
+
+            k_result, v_result = result[:block_num], result[block_num:]
+            success_block_num = 0
+            for k, v in zip(k_result, v_result):
+                if k > 0 and v > 0:
+                    success_block_num += 1
+            logger.debug(f"_run_read_storage, success_block_num: {success_block_num}")
+            valid_gpu_block_ids = gpu_block_ids[:success_block_num]
+            valid_cpu_block_ids = cpu_block_ids[:success_block_num]
+
+            mode = 1  # cpu ==> gpu
+            start_time = time.time()
+            swap_cache_layout(
+                self.gpu_cache_k_tensors,
+                self.storage_key_read_buffer,
+                self.key_cache_shape,
+                valid_gpu_block_ids,
+                valid_cpu_block_ids,
+                self.device,
+                mode,
+            )
+            swap_cache_layout(
+                self.gpu_cache_v_tensors,
+                self.storage_value_read_buffer,
+                self.value_cache_shape,
+                valid_gpu_block_ids,
+                valid_cpu_block_ids,
+                self.device,
+                mode,
+            )
+            swap_cost_time = time.time() - start_time
+            logger.debug(
+                f"_run_read_storage, swap_cost_time: {swap_cost_time:.6f}s, read_cost_time: {read_cost_time:.6f}s"
+            )
 
             return valid_gpu_block_ids
 
@@ -562,21 +594,40 @@ class CacheTransferManager:
             )
             raise
 
-    def read_storage_task(self, task: ReadStorageTask):
+    def read_storage_task(
+        self,
+        task: ReadStorageTask | int,
+        keys: List[str] | None = None,
+        gpu_block_ids: List[int] | None = None,
+        timeout: float = 30.0,
+        token_ids: List[int] | None = None,
+        start_read_block_idx: int = 0,
+    ):
         """Read cache from the storage backend to the GPU memory."""
         try:
-            gpu_block_ids = task.gpu_block_ids.copy()
+            if isinstance(task, ReadStorageTask):
+                task_id = task.task_id
+                keys = task.keys
+                token_ids = task.token_ids
+                start_read_block_idx = task.start_read_block_idx
+                timeout = task.timeout
+                gpu_block_ids = task.gpu_block_ids.copy()
+            else:
+                task_id = task
+                if keys is None or gpu_block_ids is None:
+                    raise ValueError("keys and gpu_block_ids must be provided for legacy read_storage_task calls")
+                gpu_block_ids = gpu_block_ids.copy()
+                if token_ids is None:
+                    token_ids = []
             cpu_block_ids = [i for i in range(len(gpu_block_ids))]
-            k_cache_keys = [f"{key}_key_{self.rank}" for key in task.keys]
-            v_cache_keys = [f"{key}_value_{self.rank}" for key in task.keys]
+            k_cache_keys = [f"{key}_key_{self.rank}" for key in keys]
+            v_cache_keys = [f"{key}_value_{self.rank}" for key in keys]
             match_block_num = 0
-            if self.storage_backend_type == "mooncake":
-                match_block_num = self.storage_backend.query(k_cache_keys, v_cache_keys)
-            elif self.storage_backend_type == "attention_store":
-                match_block_num = self.storage_backend.query(
-                    task.task_id, task.token_ids, task.start_read_block_idx, task.timeout
-                )
-            logger.info(f"Matched {match_block_num} blocks in cache storage for read task {task.task_id}")
+            if self.storage_backend_type == "attention_store":
+                match_block_num = self.storage_backend.query(task_id, token_ids, start_read_block_idx, timeout)
+            else:
+                match_block_num = self._storage_exist_block_num(k_cache_keys, v_cache_keys)
+            logger.info(f"Matched {match_block_num} blocks in cache storage for read task {task_id}")
 
             k_cache_keys = k_cache_keys[:match_block_num]
             v_cache_keys = v_cache_keys[:match_block_num]
@@ -586,36 +637,78 @@ class CacheTransferManager:
             if match_block_num > 0:
                 # TODO: support timeout with actual block count
                 try:
-                    valid_gpu_block_ids = self._run_read_storage(
-                        task.task_id,
-                        task.token_ids[: match_block_num * self.block_size],
-                        task.start_read_block_idx,
-                        k_cache_keys,
-                        v_cache_keys,
-                        gpu_block_ids,
-                        cpu_block_ids,
-                        task.timeout,
-                    )
+                    if self.storage_backend_type == "attention_store":
+                        valid_gpu_block_ids = self._run_read_storage(
+                            task_id,
+                            token_ids[: match_block_num * self.block_size],
+                            start_read_block_idx,
+                            k_cache_keys,
+                            v_cache_keys,
+                            gpu_block_ids,
+                            cpu_block_ids,
+                            timeout,
+                        )
+                    else:
+                        valid_gpu_block_ids = self._run_read_storage(
+                            k_cache_keys,
+                            v_cache_keys,
+                            gpu_block_ids,
+                            cpu_block_ids,
+                        )
                     logger.info(
-                        f"Successfully read {len(valid_gpu_block_ids)} blocks from cache storage for task {task.task_id}"
+                        f"Successfully read {len(valid_gpu_block_ids)} blocks from cache storage for task {task_id}"
                     )
                 except Exception as e:
-                    logger.error(f"Failed to read cache for task {task.task_id}, error: {e}")
+                    logger.error(f"Failed to read cache for task {task_id}, error: {e}")
                     valid_gpu_block_ids = []
 
-            result = (CacheStatus.STORAGE2GPU, task.task_id, task.keys, valid_gpu_block_ids)
+            result = (CacheStatus.STORAGE2GPU, task_id, keys, valid_gpu_block_ids)
             self.cache_task_queue.swap_storage_to_gpu_barrier.wait()
             self.cache_task_queue.swap_storage_to_gpu_barrier.reset()
             self.cache_task_queue.put_transfer_done_signal(result)
-            logger.debug(f"read_storage_task: put transfer done signal for {task.task_id}")
+            logger.debug(f"read_storage_task: put transfer done signal for {task_id}")
 
         except Exception as e:
             logger.error(
                 f"An error occurred in read_storage_task: "
-                f"task_id: {task.task_id}, error:{e}, {traceback.format_exc()}"
+                f"task_id: {task_id}, error:{e}, {traceback.format_exc()}"
             )
 
     def _run_write_back_storage(
+        self,
+        *args,
+        **kwargs,
+    ):
+        if args and isinstance(args[0], list):
+            k_cache_keys = args[0]
+            v_cache_keys = args[1] if len(args) > 1 else kwargs.get("v_cache_keys", [])
+            gpu_block_ids = args[2] if len(args) > 2 else kwargs.get("gpu_block_ids")
+            cpu_block_ids = args[3] if len(args) > 3 else kwargs.get("cpu_block_ids")
+            task_id = kwargs.get("task_id")
+            token_ids = kwargs.get("token_ids", [])
+            start_write_block_idx = kwargs.get("start_write_block_idx", 0)
+            timeout = kwargs.get("timeout", 30.0)
+        else:
+            task_id = args[0] if len(args) > 0 else kwargs.get("task_id")
+            token_ids = args[1] if len(args) > 1 else kwargs.get("token_ids", [])
+            start_write_block_idx = args[2] if len(args) > 2 else kwargs.get("start_write_block_idx", 0)
+            k_cache_keys = args[3] if len(args) > 3 else kwargs.get("k_cache_keys", [])
+            v_cache_keys = args[4] if len(args) > 4 else kwargs.get("v_cache_keys", [])
+            gpu_block_ids = args[5] if len(args) > 5 else kwargs.get("gpu_block_ids")
+            cpu_block_ids = args[6] if len(args) > 6 else kwargs.get("cpu_block_ids")
+            timeout = args[7] if len(args) > 7 else kwargs.get("timeout", 30.0)
+        return self._run_write_back_storage_impl(
+            task_id=task_id,
+            token_ids=token_ids,
+            start_write_block_idx=start_write_block_idx,
+            k_cache_keys=k_cache_keys,
+            v_cache_keys=v_cache_keys,
+            gpu_block_ids=gpu_block_ids,
+            cpu_block_ids=cpu_block_ids,
+            timeout=timeout,
+        )
+
+    def _run_write_back_storage_impl(
         self,
         task_id,
         token_ids,
@@ -627,56 +720,7 @@ class CacheTransferManager:
         timeout,
     ):
         try:
-            if self.storage_backend_type == "mooncake":
-                key_cache_size = [
-                    self.key_cache_shape[0],
-                    self.key_cache_shape[1],
-                    self.key_cache_shape[2],
-                    self.key_cache_shape[3],
-                ]
-                mode = 0  # gpu ==> cpu
-                start_time = time.time()
-                swap_cache_layout(
-                    self.gpu_cache_k_tensors,
-                    self.storage_key_write_buffer,
-                    key_cache_size,
-                    gpu_block_ids,
-                    cpu_block_ids,
-                    self.device,
-                    mode,
-                )
-                swap_cache_layout(
-                    self.gpu_cache_v_tensors,
-                    self.storage_value_write_buffer,
-                    key_cache_size,
-                    gpu_block_ids,
-                    cpu_block_ids,
-                    self.device,
-                    mode,
-                )
-                swap_cost_time = time.time() - start_time
-
-                block_num = len(gpu_block_ids)
-                keys = k_cache_keys + v_cache_keys
-                k_cache_ptrs = [
-                    self.storage_key_write_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
-                ]
-                v_cache_ptrs = [
-                    self.storage_value_write_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
-                ]
-                kv_cache_ptrs = k_cache_ptrs + v_cache_ptrs
-                kv_block_sizes = [self.storage_buffer_stride_bytes] * block_num * 2  # key and value
-
-                start_time = time.time()
-                self.storage_backend.batch_set(keys, target_locations=kv_cache_ptrs, target_sizes=kv_block_sizes)
-                write_cost_time = time.time() - start_time
-
-                logger.debug(
-                    f"_run_write_back_storage, swap_cost_time: {swap_cost_time:.6f}s, write_cost_time: {write_cost_time:.6f}s"
-                )
-                return block_num
-
-            elif self.storage_backend_type == "attention_store":
+            if self.storage_backend_type == "attention_store":
                 key_cache = []
                 val_cache = []
                 for i in range(self.num_layers + self.num_extra_layers):
@@ -691,31 +735,96 @@ class CacheTransferManager:
                 logger.debug(f"_run_write_back_storage, write_cost_time: {write_cost_time:.6f}s")
                 return write_block_num
 
+            key_cache_size = [
+                self.key_cache_shape[0],
+                self.key_cache_shape[1],
+                self.key_cache_shape[2],
+                self.key_cache_shape[3],
+            ]
+            mode = 0  # gpu ==> cpu
+            start_time = time.time()
+            swap_cache_layout(
+                self.gpu_cache_k_tensors,
+                self.storage_key_write_buffer,
+                key_cache_size,
+                gpu_block_ids,
+                cpu_block_ids,
+                self.device,
+                mode,
+            )
+            swap_cache_layout(
+                self.gpu_cache_v_tensors,
+                self.storage_value_write_buffer,
+                key_cache_size,
+                gpu_block_ids,
+                cpu_block_ids,
+                self.device,
+                mode,
+            )
+            swap_cost_time = time.time() - start_time
+
+            block_num = len(gpu_block_ids)
+            keys = k_cache_keys + v_cache_keys
+            k_cache_ptrs = [self.storage_key_write_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids]
+            v_cache_ptrs = [
+                self.storage_value_write_buffer + i * self.storage_buffer_stride_bytes for i in cpu_block_ids
+            ]
+            kv_cache_ptrs = k_cache_ptrs + v_cache_ptrs
+            kv_block_sizes = [self.storage_buffer_stride_bytes] * block_num * 2  # key and value
+
+            start_time = time.time()
+            self.storage_backend.batch_set(keys, target_locations=kv_cache_ptrs, target_sizes=kv_block_sizes)
+            write_cost_time = time.time() - start_time
+
+            logger.debug(
+                f"_run_write_back_storage, swap_cost_time: {swap_cost_time:.6f}s, write_cost_time: {write_cost_time:.6f}s"
+            )
+            return block_num
+
         except Exception as e:
             logger.error(
                 f"An error occurred in _run_write_back_storage, " f"error: {e}, traceback:\n{traceback.format_exc()}"
             )
             return 0
 
-    def write_back_storage_task(self, task: WriteStorageTask):
+    def write_back_storage_task(
+        self,
+        task: WriteStorageTask | int,
+        keys: List[str] | None = None,
+        gpu_block_ids: List[int] | None = None,
+        timeout: float = 30.0,
+        token_ids: List[int] | None = None,
+    ):
         """
         Write cache to the storage backend from the GPU memory.
         """
         try:
-            gpu_block_ids = task.gpu_block_ids.copy()
+            if isinstance(task, WriteStorageTask):
+                task_id = task.task_id
+                keys = task.keys
+                token_ids = task.token_ids
+                timeout = task.timeout
+                gpu_block_ids = task.gpu_block_ids.copy()
+            else:
+                task_id = task
+                if keys is None or gpu_block_ids is None:
+                    raise ValueError("keys and gpu_block_ids must be provided for legacy write_back_storage_task calls")
+                gpu_block_ids = gpu_block_ids.copy()
+                if token_ids is None:
+                    token_ids = []
             cpu_block_ids = [i for i in range(len(gpu_block_ids))]
-            k_cache_keys = [f"{key}_key_{self.rank}" for key in task.keys]
-            v_cache_keys = [f"{key}_value_{self.rank}" for key in task.keys]
+            k_cache_keys = [f"{key}_key_{self.rank}" for key in keys]
+            v_cache_keys = [f"{key}_value_{self.rank}" for key in keys]
 
             match_block_num = 0
-            if self.storage_backend_type == "mooncake":
-                match_block_num = self.storage_backend.query(k_cache_keys, v_cache_keys, task.timeout)
-            elif self.storage_backend_type == "attention_store":
-                match_block_num = self.storage_backend.query(task.task_id, task.token_ids, 0, task.timeout)
-            logger.info(f"Matched {match_block_num} blocks in cache storage for write task {task.task_id}")
+            if self.storage_backend_type == "attention_store":
+                match_block_num = self.storage_backend.query(task_id, token_ids, 0, timeout)
+            else:
+                match_block_num = self._storage_exist_block_num(k_cache_keys, v_cache_keys)
+            logger.info(f"Matched {match_block_num} blocks in cache storage for write task {task_id}")
 
             if match_block_num >= len(k_cache_keys):
-                logger.info(f"No uncached keys found for task {task.task_id}")
+                logger.info(f"No uncached keys found for task {task_id}")
                 gpu_block_ids = []
             else:
                 try:
@@ -724,24 +833,32 @@ class CacheTransferManager:
                     gpu_block_ids = gpu_block_ids[match_block_num:]
                     cpu_block_ids = cpu_block_ids[match_block_num:]
                     # TODO: support timeout with actual block count
-                    write_block_num = self._run_write_back_storage(
-                        task.task_id,
-                        task.token_ids,
-                        match_block_num,
-                        k_cache_keys,
-                        v_cache_keys,
-                        gpu_block_ids,
-                        cpu_block_ids,
-                        task.timeout,
-                    )
+                    if self.storage_backend_type == "attention_store":
+                        write_block_num = self._run_write_back_storage(
+                            task_id,
+                            token_ids,
+                            match_block_num,
+                            k_cache_keys,
+                            v_cache_keys,
+                            gpu_block_ids,
+                            cpu_block_ids,
+                            timeout,
+                        )
+                    else:
+                        write_block_num = self._run_write_back_storage(
+                            k_cache_keys,
+                            v_cache_keys,
+                            gpu_block_ids,
+                            cpu_block_ids,
+                        )
                     logger.info(
-                        f"Successfully wrote {write_block_num} blocks to cache storage for task {task.task_id}"
+                        f"Successfully wrote {write_block_num} blocks to cache storage for task {task_id}"
                     )
                 except Exception as e:
                     logger.error(f"Error in write back storage task: {e}")
                     gpu_block_ids = []
 
-            result = (CacheStatus.GPU2STORAGE, task.task_id, task.keys, gpu_block_ids)
+            result = (CacheStatus.GPU2STORAGE, task_id, keys, gpu_block_ids)
             self.cache_task_queue.swap_to_storage_barrier.wait()
             if self.rank == 0:  # 只有当rank为0时执行同步操作
                 self.cache_task_queue.swap_to_storage_barrier.reset()
@@ -751,6 +868,17 @@ class CacheTransferManager:
             logger.error(
                 f"An error occurred in write_back_storage_task, " f"error: {e}, traceback:\n{traceback.format_exc()}"
             )
+
+    def _storage_exist_block_num(self, k_cache_keys: List[str], v_cache_keys: List[str]) -> int:
+        assert len(k_cache_keys) == len(v_cache_keys)
+        if not hasattr(self.storage_backend, "exists"):
+            return 0
+        check_results = self.storage_backend.exists(k_cache_keys + v_cache_keys)
+        exist_block_num = 0
+        for k_key, v_key in zip(k_cache_keys, v_cache_keys):
+            if check_results.get(k_key) and check_results.get(v_key):
+                exist_block_num += 1
+        return exist_block_num
 
     def _do_swap_to_cpu_task(
         self,
