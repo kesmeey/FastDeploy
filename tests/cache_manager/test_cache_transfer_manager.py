@@ -809,6 +809,121 @@ class TestCacheTransferManager(unittest.TestCase):
 
         self.assertEqual(self.manager.kv_cache_status_signal.value[0], cache_transfer_manager.KVCacheStatus.NORMAL)
 
+    def test_init_with_attention_store_backend(self):
+        class LocalArgs(Args):
+            kvcache_storage_backend = "attention_store"
+
+        with (
+            patch("fastdeploy.cache_manager.cache_transfer_manager.AttentionStore") as mock_store,
+            patch.object(CacheTransferManager, "_init_cpu_cache", lambda self, args: None),
+            patch.object(CacheTransferManager, "_init_gpu_cache", lambda self, args: None),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.threading.Thread") as mock_thread,
+        ):
+            manager = CacheTransferManager(LocalArgs())
+
+        mock_store.assert_called_once()
+        mock_thread.assert_called_once()
+        self.assertEqual(manager.storage_backend_type, "attention_store")
+
+    def test_init_gpu_cache_waits_for_ready_signal(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = [value]
+
+        class LocalArgs(Args):
+            create_cache_tensor = False
+            num_layers = 1
+            key_cache_shape = "2,1,1,1"
+            value_cache_shape = "2,1,1,1"
+
+        with (
+            patch.object(CacheTransferManager, "_init_cpu_cache", lambda self, args: None),
+            patch.object(CacheTransferManager, "_init_gpu_cache", lambda self, args: None),
+        ):
+            manager = CacheTransferManager(LocalArgs())
+
+        manager.cache_ready_signal = DummySignal(0)
+        manager.gpu_cache_kvs = {}
+        manager.gpu_cache_k_tensors = []
+        manager.gpu_cache_v_tensors = []
+
+        def fake_sleep(_):
+            manager.cache_ready_signal.value[0] = 1
+
+        def fake_share(tensor, name, shape, _):
+            return paddle.zeros(shape=shape, dtype=tensor.dtype)
+
+        with (
+            patch("fastdeploy.cache_manager.cache_transfer_manager.set_device"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.share_external_data_", side_effect=fake_share),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.memory_allocated", return_value=0),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.time.sleep", side_effect=fake_sleep),
+        ):
+            self._orig_init_gpu_cache(manager, LocalArgs())
+
+        self.assertEqual(manager.cache_ready_signal.value[0], 1)
+        self.assertIn("key_caches_0_rank0.device0", manager.gpu_cache_kvs)
+        self.assertIn("value_caches_0_rank0.device0", manager.gpu_cache_kvs)
+
+    def test_run_read_storage_attention_store_path(self):
+        class DummyStorage:
+            def __init__(self):
+                self.calls = []
+
+            def read(self, task_id, key_cache, val_cache, token_ids, gpu_block_ids, start_read_block_idx, timeout):
+                self.calls.append(
+                    (task_id, len(key_cache), len(val_cache), token_ids, gpu_block_ids, start_read_block_idx, timeout)
+                )
+                return 1
+
+        self.manager.storage_backend_type = "attention_store"
+        self.manager.storage_backend = DummyStorage()
+        self.manager.gpu_cache_kvs = {
+            "key_caches_0_rank0.device0": paddle.zeros([1]),
+            "value_caches_0_rank0.device0": paddle.zeros([1]),
+        }
+        self.manager.num_layers = 1
+        self.manager.num_extra_layers = 0
+        self.manager.rank = 0
+        self.manager.device = 0
+
+        result = self.manager._run_read_storage("task", [1, 2], 0, ["k1"], ["v1"], [5], [0], 0.3)
+
+        self.assertEqual(result, [5])
+        self.assertEqual(self.manager.storage_backend.calls[0][0], "task")
+
+    def test_run_write_back_storage_attention_store_path(self):
+        class DummyStorage:
+            def __init__(self):
+                self.calls = []
+
+            def write(self, task_id, key_cache, val_cache, token_ids, gpu_block_ids, start_write_block_idx, timeout):
+                self.calls.append(
+                    (task_id, len(key_cache), len(val_cache), token_ids, gpu_block_ids, start_write_block_idx, timeout)
+                )
+                return 2
+
+        self.manager.storage_backend_type = "attention_store"
+        self.manager.storage_backend = DummyStorage()
+        self.manager.gpu_cache_kvs = {
+            "key_caches_0_rank0.device0": paddle.zeros([1]),
+            "value_caches_0_rank0.device0": paddle.zeros([1]),
+        }
+        self.manager.num_layers = 1
+        self.manager.num_extra_layers = 0
+        self.manager.rank = 0
+        self.manager.device = 0
+
+        result = self.manager._run_write_back_storage("task", [1, 2], 0, ["k1"], ["v1"], [7], [0], 0.4)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(self.manager.storage_backend.calls[0][0], "task")
+
+    def test_storage_exist_block_num_missing_backend_method(self):
+        self.manager.storage_backend = object()
+        result = self.manager._storage_exist_block_num(["k1"], ["v1"])
+        self.assertEqual(result, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
