@@ -2176,6 +2176,32 @@ class TestEngineClientValidParameters(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status_code, 404)
         self.assertIn("clear prefix tree timeout", message["msg"])
 
+    def test_prefix_tree_update_timeout(self):
+        """Test update_model_weight prefix tree timeout path."""
+        self.engine_client.enable_prefix_caching = True
+        self.engine_client.enable_cache_transfer = False
+        self.engine_client.prefix_tree_status_signal.value = np.array([PrefixTreeStatus.CLEARED])
+        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.CLEARED])
+
+        with patch("time.sleep", return_value=None):
+            result, message = self.engine_client.update_model_weight(timeout=0)
+
+        self.assertFalse(result)
+        self.assertEqual(message, "Update prefix tree timeout")
+
+    def test_prefix_tree_clear_timeout(self):
+        """Test clear_load_weight prefix tree timeout path."""
+        self.engine_client.enable_prefix_caching = True
+        self.engine_client.enable_cache_transfer = False
+        self.engine_client.prefix_tree_status_signal.value = np.array([PrefixTreeStatus.NORMAL])
+        self.engine_client.model_weights_status_signal.value = np.array([ModelWeightsStatus.NORMAL])
+
+        with patch("time.sleep", return_value=None):
+            result, message = self.engine_client.clear_load_weight(timeout=0)
+
+        self.assertFalse(result)
+        self.assertEqual(message, "Clear prefix tree timeout")
+
     def test_abort_with_request_suffix_and_disconnect_flag(self):
         """Test abort sends requests with suffix when disconnect flag is enabled."""
         self.engine_client.enable_mm = True
