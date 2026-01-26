@@ -258,6 +258,8 @@ class TestEngineWorkerQueue(unittest.TestCase):
         envs.FD_ENABLE_MAX_PREFILL = 1
         envs.FD_ENABLE_E2W_TENSOR_CONVERT = 0
         server, client = self._build_queue_pair()
+        previous_device = paddle.get_device()
+        paddle.set_device("cpu")
         try:
             np_images = paddle.randn([1, 3, 4, 4]).numpy()
             task = DummyTask(np_images)
@@ -311,6 +313,7 @@ class TestEngineWorkerQueue(unittest.TestCase):
             client.get_finished_add_cache_task_req()
             thread.join()
         finally:
+            paddle.set_device(previous_device)
             self._cleanup_queue_pair(server)
 
     def test_connect_rdma_task_flow(self):
