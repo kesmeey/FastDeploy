@@ -14,861 +14,1242 @@
 # limitations under the License.
 """
 
-import os
+from __future__ import annotations
+
 import time
-import unittest
-from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
 
 import numpy as np
+import paddle
+import pytest
 
-from fastdeploy.engine.args_utils import EngineArgs
-from fastdeploy.engine.common_engine import EngineService
+if not hasattr(paddle, "compat"):
+    paddle.compat = SimpleNamespace(enable_torch_proxy=lambda scope=None: None)
 
-MODEL_NAME = os.getenv("MODEL_PATH", "/path/to/models") + "/ERNIE-4.5-0.3B-Paddle"
+from fastdeploy.engine import engine as engine_module
+from fastdeploy.engine.sampling_params import SamplingParams
+from fastdeploy.utils import EngineError
 
 
-class TestCommonEngine(unittest.TestCase):
-    """Test case for EngineService functionality (lines 1215-1664)"""
+class DummyMetrics:
+    def __init__(self):
+        self.scheduler_recv_req_time = None
+        self.preprocess_start_time = None
+        self.preprocess_end_time = None
 
-    @classmethod
-    def setUpClass(cls):
-        """Set up EngineService for testing"""
-        try:
-            # Create engine args for testing
-            engine_args = EngineArgs(
-                model=MODEL_NAME,
-                max_model_len=8192,
-                tensor_parallel_size=1,
-                engine_worker_queue_port=int(os.getenv("FD_ENGINE_QUEUE_PORT", "6778")),
-                cache_queue_port=int(os.getenv("FD_CACHE_QUEUE_PORT", "6779")),
-            )
 
-            # Create and start the engine service
-            cls.cfg = engine_args.create_engine_config()
-            cls.engine = EngineService(cls.cfg, start_queue=True, use_async_llm=True)
+class DummyRequest:
+    def __init__(self, prompt_token_ids=None, sampling_params=None, **kwargs):
+        self.prompt_token_ids = prompt_token_ids or []
+        self.prompt_token_ids_len = None
+        self.need_prefill_tokens = None
+        self.metrics = DummyMetrics()
+        self.sampling_params = sampling_params or SamplingParams()
+        self.guided_json = kwargs.get("guided_json")
+        self.guided_regex = kwargs.get("guided_regex")
+        self.guided_choice = kwargs.get("guided_choice")
+        self.structural_tag = kwargs.get("structural_tag")
+        self.guided_grammar = kwargs.get("guided_grammar")
+        self.guided_json_object = kwargs.get("guided_json_object")
+        self.stop_seqs_len = kwargs.get("stop_seqs_len")
+        self.request_id = kwargs.get("request_id", "req")
+        self.chat_template = None
 
-            # Start the engine service
-            cls.engine.start()
+    def get(self, key, default=None):
+        if hasattr(self, key):
+            return getattr(self, key)
+        if hasattr(self.sampling_params, key):
+            return getattr(self.sampling_params, key)
+        return default
 
-        except Exception as e:
-            print(f"Setting up EngineService failed: {e}")
-            raise
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up after all tests"""
-        if hasattr(cls, "engine") and cls.engine is not None:
-            try:
-                cls.engine._exit_sub_services()
-                print("Engine cleanup completed")
-            except Exception as e:
-                print(f"Error during engine cleanup: {e}")
-
-    def setUp(self):
-        """Set up before each test method"""
-        print(f"Starting test: {self._testMethodName}")
-
-    def tearDown(self):
-        """Clean up after each test method"""
-        print(f"Completed test: {self._testMethodName}")
-
-    def test_exit_sub_services(self):
-        """Test _exit_sub_services method (lines 1215-1291)"""
-        # Test that _exit_sub_services can be called without error
-        # Note: We won't actually call it since it would shut down the engine
-        # Instead we'll test that the method exists and has expected attributes
-        self.assertTrue(hasattr(self.engine, "_exit_sub_services"))
-        self.assertTrue(callable(getattr(self.engine, "_exit_sub_services")))
-
-        # Test that engine has expected attributes that would be cleaned up
-        if hasattr(self.engine, "worker_proc"):
-            self.assertIsNotNone(self.engine.worker_proc)
-
-        # Verify running state
-        self.assertTrue(self.engine.running)
-
-    def test_worker_processes_ready(self):
-        """Test _worker_processes_ready method (lines 1292-1299)"""
-        # Test with real engine that should have worker_ready_signal
-        if hasattr(self.engine, "worker_ready_signal"):
-            result = self.engine._worker_processes_ready()
-            # Result should be boolean
-            self.assertIsInstance(result, bool)
+    def set(self, key, value):
+        if hasattr(self.sampling_params, key):
+            setattr(self.sampling_params, key, value)
         else:
-            self.skipTest("worker_ready_signal not available")
-
-    def test_init_worker_signals(self):
-        """Test _init_worker_signals method (lines 1301-1361)"""
-        # Since engine is already started, signals should be initialized
-        self.assertTrue(hasattr(self.engine, "worker_ready_signal"))
-        self.assertTrue(hasattr(self.engine, "loaded_model_signal"))
-
-        # Test that signals have expected properties
-        if hasattr(self.engine, "worker_ready_signal"):
-            self.assertIsNotNone(self.engine.worker_ready_signal)
-
-        if hasattr(self.engine, "loaded_model_signal"):
-            self.assertIsNotNone(self.engine.loaded_model_signal)
-
-    def test_setting_environ_variables(self):
-        """Test _setting_environ_variables method (lines 1362-1408)"""
-        result = self.engine._setting_environ_variables()
-
-        # Check that result is a string and contains expected variables
-        self.assertIsInstance(result, str)
-        self.assertIn("ENABLE_FASTDEPLOY_LOAD_MODEL_CONCURRENCY=0", result)
-        self.assertIn("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python", result)
-        self.assertIn("FLAGS_use_append_attn=1", result)
-        self.assertIn("NCCL_ALGO=Ring", result)
-
-    def test_start_worker_service(self):
-        """Test _start_worker_service method (lines 1409-1517)"""
-        # Since engine is already started, we can test that worker process exists
-        if hasattr(self.engine, "worker_proc") and self.engine.worker_proc:
-            # Worker process should be running
-            self.assertIsNotNone(self.engine.worker_proc)
-            # Process should be alive (poll returns None if still running)
-            poll_result = self.engine.worker_proc.poll()
-            if poll_result is not None:
-                self.skipTest("Worker process is not running")
-        else:
-            self.skipTest("Worker process not available")
-
-    def test_stop_profile(self):
-        """Test _stop_profile method (lines 1519-1532)"""
-        # Test method exists and is callable
-        self.assertTrue(hasattr(self.engine, "_stop_profile"))
-        self.assertTrue(callable(getattr(self.engine, "_stop_profile")))
-
-        # We won't actually call it as it modifies engine state
-        # Just verify the do_profile attribute exists
-        self.assertTrue(hasattr(self.engine, "do_profile"))
-
-    def test_check_health(self):
-        """Test check_health method (lines 1533-1544)"""
-        if hasattr(self.engine, "worker_healthy_live_signal"):
-            is_healthy, message = self.engine.check_health(time_interval_threashold=30)
-
-            # Should return tuple of (bool, str)
-            self.assertIsInstance(is_healthy, bool)
-            self.assertIsInstance(message, str)
-        else:
-            self.skipTest("worker_healthy_live_signal not available")
-
-    def test_launch_components(self):
-        """Test launch_components method (lines 1545-1605)"""
-        # Method should exist and be callable
-        self.assertTrue(hasattr(self.engine, "launch_components"))
-        self.assertTrue(callable(getattr(self.engine, "launch_components")))
-
-        # Test that scheduler exists (should be created during start)
-        if hasattr(self.engine, "scheduler"):
-            self.assertIsNotNone(self.engine.scheduler)
-
-    def test_check_worker_initialize_status(self):
-        """Test check_worker_initialize_status method (lines 1606-1663)"""
-        # Method should exist and be callable
-        self.assertTrue(hasattr(self.engine, "check_worker_initialize_status"))
-        self.assertTrue(callable(getattr(self.engine, "check_worker_initialize_status")))
-
-        # Test that worker_init_status exists
-        if hasattr(self.engine, "worker_init_status"):
-            self.assertIsInstance(self.engine.worker_init_status, dict)
-
-    def test_engine_started_successfully(self):
-        """Test that engine started successfully and has expected state"""
-        # Verify engine is running
-        self.assertTrue(self.engine.running)
-
-        # Verify data processor was created
-        if hasattr(self.engine, "data_processor"):
-            self.assertIsNotNone(self.engine.data_processor)
-
-        # Verify IPC signal suffix is set
-        if hasattr(self.engine, "ipc_signal_suffix"):
-            self.assertIsNotNone(self.engine.ipc_signal_suffix)
+            setattr(self, key, value)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class DummySignal:
+    def __init__(self, name, array, dtype, suffix, create):
+        self.name = name
+        self.value = array
+        self.cleared = False
+
+    def clear(self):
+        self.cleared = True
 
 
-class TestCommonEngineAdditionalCoverage(unittest.TestCase):
-    """Additional unit tests focusing on branch coverage for common_engine.py
+class DummyTokenizer:
+    def __init__(self):
+        self.vocab = {"</think>": 10, "<|IMAGE_PLACEHOLDER|>": 11, "\n": 12}
 
-    These tests heavily mock subprocess/threading/IPC to avoid starting real workers
-    and to drive specific code paths that were previously uncovered.
-    """
+    def get_vocab(self):
+        return self.vocab
 
-    def setUp(self):
-        patch("fastdeploy.engine.common_engine.EngineCacheQueue").start()
 
-    def _make_cfg(self, **kwargs):
-        # If DP > 1, we must provide enough engine_worker_queue_port for each dp index
-        dp = kwargs.get("data_parallel_size", 1)
-        nnode = len(kwargs.get("ips", ["127.0.0.1"]))
-        engine_worker_queue_port = int(os.getenv("FD_ENGINE_QUEUE_PORT", "6778"))
-        cache_queue_port = int(os.getenv("FD_CACHE_QUEUE_PORT", "6779"))
-        if dp and dp > 1:
-            engine_worker_queue_port = [engine_worker_queue_port + 21 + i for i in range(dp // nnode)]
-            cache_queue_port = [cache_queue_port + 21 + i for i in range(dp // nnode)]
+class DummyEngineArgs:
+    def __init__(self, cfg):
+        self._cfg = cfg
 
-        args = EngineArgs(
-            model=MODEL_NAME,
-            max_model_len=128,
-            tensor_parallel_size=1,
-            # give unique ports to avoid collision with other tests
-            engine_worker_queue_port=engine_worker_queue_port,
-            cache_queue_port=cache_queue_port,
-            enable_prefix_caching=True,
-            **kwargs,
+    def create_engine_config(self):
+        return self._cfg
+
+
+def build_cfg(splitwise_role="prefill"):
+    cache_config = SimpleNamespace(
+        gpu_memory_utilization=0.9,
+        block_size=8,
+        enc_dec_block_num=0,
+        kv_cache_ratio=0.5,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=False,
+        num_gpu_blocks_override=None,
+        num_cpu_blocks=1,
+        cache_transfer_protocol="tcp",
+        max_encoder_cache=0,
+        total_block_num=0,
+    )
+    cache_config.reset_called_with = None
+
+    def reset(num_blocks):
+        cache_config.reset_called_with = num_blocks
+
+    cache_config.reset = reset
+    model_config = SimpleNamespace(
+        max_model_len=8,
+        model="dummy",
+        quantization={"bits": 4},
+        num_hidden_layers=2,
+        runner="runner",
+        convert=False,
+        override_pooler_config="",
+        logprobs_mode="none",
+        max_logprobs=0,
+        model_impl="impl",
+        enable_logprob=False,
+        lm_head_fp32=False,
+        enable_entropy=False,
+    )
+    scheduler_config = SimpleNamespace(
+        max_num_seqs=4,
+        max_num_batched_tokens=32,
+        splitwise_role=splitwise_role,
+        name="splitwise",
+    )
+    parallel_config = SimpleNamespace(
+        engine_worker_queue_port=[5555],
+        device_ids="0",
+        tensor_parallel_size=1,
+        expert_parallel_size=1,
+        chunked_moe_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_chunked_moe=False,
+        disable_custom_all_reduce=False,
+        use_internode_ll_two_stage=False,
+        disable_sequence_parallel_moe=False,
+        shutdown_comm_group_if_worker_idle=False,
+    )
+    structured_outputs_config = SimpleNamespace(
+        guided_decoding_backend="none",
+        logits_processors=None,
+        disable_any_whitespace=False,
+        reasoning_parser="",
+    )
+    load_config = SimpleNamespace(
+        load_strategy="auto",
+        rsync_config={},
+        dynamic_load_weight=False,
+        load_choices="",
+    )
+    to_json = lambda: "{}"
+    cfg = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
+        structured_outputs_config=structured_outputs_config,
+        load_config=load_config,
+        speculative_config=SimpleNamespace(to_json_string=to_json),
+        graph_opt_config=SimpleNamespace(to_json_string=to_json),
+        early_stop_config=SimpleNamespace(to_json_string=to_json),
+        eplb_config=SimpleNamespace(to_json_string=to_json),
+        routing_replay_config=SimpleNamespace(to_json_string=to_json),
+        plas_attention_config=SimpleNamespace(to_json_string=to_json),
+        master_ip="127.0.0.1",
+        ips=None,
+        nnode=1,
+        host_ip="127.0.0.1",
+        register_info=None,
+        node_rank=0,
+        worker_num_per_node=1,
+    )
+    cfg.print = lambda: None
+    return cfg
+
+
+def test_has_guided_input_detection():
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    blank_request = DummyRequest()
+    guided_request = DummyRequest(guided_json={"a": 1})
+    assert engine._has_guided_input(blank_request) is False
+    assert engine._has_guided_input(guided_request) is True
+
+
+def test_from_engine_args_initializes_engine(monkeypatch):
+    cfg = build_cfg()
+    cfg.cache_config.num_gpu_blocks_override = None
+    created = {}
+
+    class DummyEngineService:
+        def __init__(self, passed_cfg):
+            created["cfg"] = passed_cfg
+
+    monkeypatch.setattr(engine_module, "EngineService", DummyEngineService)
+    monkeypatch.setattr(engine_module.weakref, "finalize", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        engine_module.main_process_metrics, "set_cache_config_info", lambda obj: created.setdefault("metrics", obj)
+    )
+    monkeypatch.setattr(engine_module.tracing, "trace_set_thread_info", lambda name: created.setdefault("trace", name))
+
+    engine = engine_module.LLMEngine.from_engine_args(DummyEngineArgs(cfg))
+
+    assert engine.cfg is cfg
+    assert created["cfg"] is cfg
+    assert engine.do_profile == 1
+    assert created["metrics"] is cfg.cache_config
+    assert created["trace"] == "engine"
+
+
+def test_from_engine_args_disables_profile(monkeypatch):
+    cfg = build_cfg()
+    cfg.cache_config.num_gpu_blocks_override = 1
+    created = {}
+
+    class DummyEngineService:
+        def __init__(self, passed_cfg):
+            created["cfg"] = passed_cfg
+
+    monkeypatch.setattr(engine_module, "EngineService", DummyEngineService)
+    monkeypatch.setattr(engine_module.weakref, "finalize", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(engine_module.main_process_metrics, "set_cache_config_info", lambda obj: None)
+    monkeypatch.setattr(engine_module.tracing, "trace_set_thread_info", lambda name: None)
+
+    engine = engine_module.LLMEngine.from_engine_args(DummyEngineArgs(cfg))
+
+    assert engine.do_profile == 0
+    assert created["cfg"] is cfg
+
+
+def test_add_requests_updates_sampling_and_puts_request(monkeypatch):
+    paddle.ones([1])
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+    captured = {}
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1, 2], sampling_params=SamplingParams(min_tokens=1, max_tokens=6))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1, 2]
+        captured["chat_template_kwargs"] = kwargs.get("chat_template_kwargs")
+        return request
+
+    class DummyScheduler:
+        def put_requests(self, requests):
+            captured["requests"] = requests
+
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=DummyScheduler(),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+    sampling_params = SamplingParams(temperature=0.0, min_tokens=1, max_tokens=6)
+
+    engine.add_requests({"prompt": "hi"}, sampling_params=sampling_params)
+
+    assert sampling_params.temperature == pytest.approx(1e-06)
+    assert captured["requests"][0].prompt_token_ids_len == 2
+    assert captured["chat_template_kwargs"]["chat_template"] is None
+
+
+def test_add_requests_raises_on_min_tokens_exceed(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1, 2, 3, 4, 5], sampling_params=SamplingParams(min_tokens=4))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        return request
+
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+
+    with pytest.raises(EngineError) as excinfo:
+        engine.add_requests({"prompt": "hi"}, sampling_params=SamplingParams(min_tokens=4, max_tokens=6))
+    assert excinfo.value.error_code == 400
+
+
+def test_add_requests_raises_on_input_ids_exceed(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+
+    def fake_from_dict(task):
+        return DummyRequest(
+            prompt_token_ids=[1] * 10,
+            sampling_params=SimpleNamespace(min_tokens=-5, max_tokens=6),
         )
-        # Keep batch tokens small to satisfy FDConfig checks:
-        # max_num_batched_tokens <= max_model_len * max_num_seqs
-        if getattr(args, "max_num_batched_tokens", None) is None:
-            args.max_num_batched_tokens = 128
-        # Always enable chunked prefill in tests to avoid another strict check
-        args.enable_chunked_prefill = True
-
-        return args.create_engine_config()
-
-    def _stub_processor(self):
-        class _Tok:
-            def __init__(self):
-                self.vocab = {"</think>": 42, "\n": 10, "<|IMAGE_PLACEHOLDER|>": 9}
-
-            def get_vocab(self):
-                return self.vocab
-
-        class _Proc:
-            def __init__(self):
-                self.tokenizer = _Tok()
-                self.eos_token_id_len = 1
-                self.pad_token_id = 0
-
-        return _Proc()
-
-    def test_start_prefill_branch_cache_manager_and_worker_dead(self):
-        """Cover lines 184-185, 194-197, 221, 226-227 in start()."""
-        # For prefill + local scheduler the core code now requires a router.
-        # Also, with the newer CacheConfig semantics we must ensure that
-        # prefill_kvcache_block_num (num_gpu_blocks_override * kv_cache_ratio)
-        # is >= max_block_num_per_seq; use 3 blocks so that with the default
-        # kv_cache_ratio=0.75 we still satisfy the assertion.
-        with patch("fastdeploy.engine.args_utils.envs.ENABLE_V1_KVCACHE_SCHEDULER", 0):
-            cfg = self._make_cfg(
-                splitwise_role="prefill",
-                num_gpu_blocks_override=4,
-                router="0.0.0.0:30000",
-                kv_cache_ratio=1,
-            )
-
-        # Patch EngineWorkerQueue before EngineService ctor to avoid real IPC
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-            def num_tasks(self):
-                return 0
-
-            def num_cache_infos(self):
-                return 0
-
-            def disaggregate_queue_empty(self):
-                return True
-
-            def get_disaggregated_tasks(self):
-                return []
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        # Patch heavy pieces
-        eng.create_data_processor = lambda: setattr(eng, "data_processor", self._stub_processor())
-        eng._process_splitwise_task = lambda: None
-        eng._schedule_request_to_worker = lambda: None
-        eng._schedule_request_to_worker_v1 = lambda: None
-
-        started_cache = {}
-
-        def fake_start_cache(device_ids, suffix):
-            started_cache["called"] = True
-            # return a list to mimic processes
-            return [object()]
 
-        eng.start_cache_service = fake_start_cache
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1] * 10
+        return request
 
-        # Signals: make loaded_model_signal ready immediately; include launched_cache_manager_signal
-        class Sig:
-            def __init__(self, v=0):
-                self.value = np.array([v], dtype=np.int32)
-
-            def clear(self):
-                pass
-
-        def fake_init_signals():
-            eng.worker_ready_signal = Sig(0)
-            eng.loaded_model_signal = Sig(1)  # ready -> skip wait loop
-            eng.launched_cache_manager_signal = Sig(0)
-
-        eng._init_worker_signals = fake_init_signals
-
-        # Worker start stub and initialization status -> False to trigger error path
-        eng._start_worker_service = lambda: Mock(stdout=Mock(), poll=lambda: None)
-        eng.check_worker_initialize_status = lambda: False
-
-        with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
-            # Avoid starting token processor loop
-            eng.token_processor.run = lambda: None
-            ok = eng.start(async_llm_pid=12345)
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
 
-        # start() returns False on failure
-        self.assertFalse(ok)
-        # cache manager started before workers (lines 184-185)
-        self.assertTrue(started_cache.get("called", False))
-        # avoid atexit finalizer
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+    with pytest.raises(EngineError):
+        engine.add_requests({"prompt": "hi"}, sampling_params=None)
 
-    def test_start_mixed_branch_cache_after_load_and_zmq(self):
-        """Cover lines 215-217 and 231 in start()."""
-        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-            def num_tasks(self):
-                return 0
-
-            def num_cache_infos(self):
-                return 0
-
-            def disaggregate_queue_empty(self):
-                return True
-
-            def get_disaggregated_tasks(self):
-                return []
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        eng.create_data_processor = lambda: setattr(eng, "data_processor", self._stub_processor())
-        eng._process_splitwise_task = lambda: None
-        eng._schedule_request_to_worker = lambda: None
-        eng._schedule_request_to_worker_v1 = lambda: None
-
-        started_cache = {}
-
-        def fake_start_cache(device_ids, suffix):
-            started_cache["called"] = True
-            return [object()]
-
-        eng.start_cache_service = fake_start_cache
-
-        class Sig:
-            def __init__(self, v=0):
-                self.value = np.array([v], dtype=np.int32)
-
-            def clear(self):
-                pass
-
-        def fake_init_signals():
-            eng.worker_ready_signal = Sig(0)
-            eng.loaded_model_signal = Sig(1)
-            eng.launched_cache_manager_signal = Sig(0)
-
-        eng._init_worker_signals = fake_init_signals
-
-        eng._start_worker_service = lambda: Mock(stdout=Mock(), poll=lambda: None)
-        eng.check_worker_initialize_status = lambda: True
-
-        zmq_called = {}
-        eng.start_zmq_service = lambda pid: zmq_called.setdefault("pid", pid)
-
-        with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
-            eng.token_processor.run = lambda: None
-            eng.start(async_llm_pid=8888)
-
-        self.assertTrue(started_cache.get("called", False))  # lines 215-217
-        self.assertEqual(zmq_called.get("pid"), 8888)  # line 231
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_insert_zmq_task_error_logging(self):
-        """Cover lines 934-935 and 937 in _insert_zmq_task_to_scheduler."""
-        cfg = self._make_cfg(splitwise_role="mixed")
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=False)
-        eng.running = True
-
-        class DummyRecv:
-            def __init__(self, msg):
-                self.msg = msg
-                self.call_count = 0
-
-            def receive_json_once(self, block):
-                self.call_count += 1
-                if self.call_count == 1:
-                    return self.msg, None
-                else:
-                    eng.running = False
-                    return None, None
-
-            def receive_pyobj_once(self, block):
-                return self.msg, None
-
-            def close(self):
-                pass
-
-        # Case 1: context terminated -> info branch
-        eng.recv_request_server = DummyRecv("Context was terminated")
-        with patch.object(eng, "llm_logger") as mock_logger:
-            with patch("fastdeploy.engine.common_engine.ZmqIpcServer"):
-                eng._insert_zmq_task_to_scheduler()
-            # verify info logger
-            mock_logger.info.assert_called()
-
-        # reset status
-        eng.running = True
-
-        # Case 2: other error -> error branch
-        eng.recv_request_server = DummyRecv("Other Error")
-        with patch.object(eng, "llm_logger") as mock_logger:
-            with patch("fastdeploy.engine.common_engine.ZmqIpcServer"):
-                eng._insert_zmq_task_to_scheduler()
-            # verify error logger
-            mock_logger.error.assert_called()
-
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_exit_sub_services_cleanup_paths(self):
-        """Cover lines 1312-1340, 1350-1354 in _exit_sub_services."""
-        cfg = self._make_cfg(splitwise_role="mixed")
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        # attach stubs used by cleanup
-        class Sig:
-            def __init__(self):
-                self.value = np.array([0], dtype=np.int32)
-
-            def clear(self):
-                pass
-
-        eng.worker_ready_signal = Sig()
-        eng.loaded_model_signal = Sig()
-        eng.exist_task_signal = Sig()
-        eng.exist_swapped_task_signal = Sig()
-        eng.worker_healthy_live_signal = Sig()
-        eng.cache_ready_signal = Sig()
-        eng.swap_space_ready_signal = Sig()
-        eng.exist_prefill_task_signal = Sig()
-        eng.model_weights_status_signal = Sig()
-        eng.prefix_tree_status_signal = Sig()
-        eng.kv_cache_status_signal = Sig()
-        eng.send_response_server = Mock()
-        eng.recv_request_server = Mock()
-        eng.recv_control_cmd_server = Mock()
-
-        # ensure cache manager control flags exist before first call
-        eng.resource_manager.cache_manager.shm_cache_task_flag_broadcast = Mock(clear=lambda: None)
-        eng.resource_manager.cache_manager.cache_ready_signal = Mock(clear=lambda: None)
-        eng.cache_manager_processes = []
-
-        # worker_proc kill raises -> cover 1312-1313
-        eng.worker_proc = MagicMock(pid=1001)
-        with patch("fastdeploy.engine.common_engine.os.getpgid", side_effect=RuntimeError("boom")):
-            eng._exit_sub_services()
-
-        # Prepare cache manager processes to hit both normal and exception branch
-        class DummyCacheMgr:
-            def __init__(self, pid, raise_on_kill=False):
-                self.pid = pid
-                self.raise_on_kill = raise_on_kill
-
-        eng.cache_manager_processes = [DummyCacheMgr(2001, False), DummyCacheMgr(2002, True)]
-        eng.resource_manager.cache_manager.shm_cache_task_flag_broadcast = Mock(clear=lambda: None)
-        eng.resource_manager.cache_manager.cache_ready_signal = Mock(clear=lambda: None)
-
-        def fake_getpgid(pid):
-            return pid
-
-        def fake_killpg(pid, sig):
-            if pid == 2002:
-                raise RuntimeError("kill fail")
-
-        # cache_task_queue with cleanup
-        eng.cache_task_queue = Mock()
-        eng.cache_task_queue.cleanup = Mock()
-
-        eng.dp_processed = [Mock(pid=3001, join=lambda: None)]
-        eng.dp_engine_worker_queue_server = [Mock(cleanup=lambda: None)]
-
-        with (
-            patch("fastdeploy.engine.common_engine.os.getpgid", side_effect=fake_getpgid),
-            patch("fastdeploy.engine.common_engine.os.killpg", side_effect=fake_killpg),
-        ):
-            eng._exit_sub_services()
-
-        # Now cover manager.shutdown warning path (no cleanup attribute)
-        class DummyMgr:
-            def __init__(self):
-                self.manager = Mock(shutdown=Mock(side_effect=RuntimeError("shutdown fail")))
-
-        eng.cache_task_queue = DummyMgr()
-        eng._exit_sub_services()
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_setting_environ_variables_v1_prefill_mm(self):
-        """Cover lines 1476-1485 in _setting_environ_variables."""
-        # For prefill + local scheduler the core code now requires a router
-        # and ENABLE_V1_KVCACHE_SCHEDULER=0 when using the default IPC protocol.
-        with patch("fastdeploy.engine.args_utils.envs.ENABLE_V1_KVCACHE_SCHEDULER", 0):
-            cfg = self._make_cfg(splitwise_role="prefill", router="0.0.0.0:30000")
-        cfg.model_config.enable_mm = True
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-        with patch("fastdeploy.engine.common_engine.envs.ENABLE_V1_KVCACHE_SCHEDULER", True):
-            prefix = eng._setting_environ_variables()
-        self.assertIn("FLAGS_use_pd_disaggregation_per_chunk=1", prefix)
-        self.assertIn("FLAGS_fmt_write_cache_completed_signal=1", prefix)
-        self.assertIn("FLAGS_max_partition_size=1024", prefix)
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_start_worker_service_cmd_build(self):
-        """Cover 1517, 1526, 1568, 1592, 1595 by building the worker command with mocks."""
-        with patch("fastdeploy.config.get_host_ip", return_value="127.0.0.1"):
-            cfg = self._make_cfg(
-                splitwise_role="mixed", num_gpu_blocks_override=4, ips=["127.0.0.1", "127.0.0.2"], data_parallel_size=2
-            )
-        # Make model multi-modal so env var branch already covered above; here not required
-        cfg.structured_outputs_config.logits_processors = ["A", "B"]
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-        eng.data_processor = self._stub_processor()
-
-        captured = {"cmd": None}
-
-        class DummyProc:
-            def __init__(self):
-                self.stdout = None
-
-            def poll(self):
-                return None
-
-        def fake_popen(cmd, stdout, shell, preexec_fn):
-            captured["cmd"] = cmd
-            return DummyProc()
-
-        with patch("fastdeploy.engine.common_engine.subprocess.Popen", side_effect=fake_popen):
-            with patch("fastdeploy.engine.common_engine.llm_logger"):
-                p = eng._start_worker_service()
-
-        self.assertIsNotNone(p)
-        self.assertIsInstance(captured["cmd"], str)
-        # logits processors added (1568)
-        self.assertIn("--logits-processors A B", captured["cmd"])  # type: ignore
-        # num_gpu_blocks_override added (1592)
-        self.assertIn("--num_gpu_blocks_override 4", captured["cmd"])  # type: ignore
-        # ips/nnodes added when nnode > 1 (1595)
-        self.assertIn("--nnodes 2", captured["cmd"])  # type: ignore
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_check_health_unhealthy(self):
-        """Cover line 1628: unhealthy worker."""
-        cfg = self._make_cfg(splitwise_role="mixed")
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        class Sig:
-            def __init__(self, v):
-                self.value = np.array([v], dtype=np.int32)
-
-        # set worker live time far past threshold
-        eng.worker_healthy_live_signal = Sig(int(time.time()) - 1000)
-        ok, msg = eng.check_health(time_interval_threashold=1)
-        self.assertFalse(ok)
-        self.assertIn("Not Healthy".lower(), msg.lower())
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_launch_components_expert_parallel(self):
-        """Cover 1635-1638, 1660-1676, 1684-1703 in launch_components()."""
-        # For prefill + local scheduler the core code now requires a router
-        # and ENABLE_V1_KVCACHE_SCHEDULER=0 when using the default IPC protocol.
-        with patch("fastdeploy.engine.args_utils.envs.ENABLE_V1_KVCACHE_SCHEDULER", 0):
-            cfg = self._make_cfg(
-                splitwise_role="prefill",
-                # enable expert parallel and dp > 1 to go into the branch
-                data_parallel_size=2,
-                enable_expert_parallel=True,
-                router="0.0.0.0:30000",
-            )
-
-        # Provide EngineWorkerQueue stub for ctor
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=True, use_async_llm=True)
-
-        # Init signals to create launched_expert_service_signal
-        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_MULTI_API_SERVER", False):
-            eng.ipc_signal_suffix = cfg.parallel_config.engine_worker_queue_port[0]
-            eng._init_worker_signals()
-
-            # Don't create real queues/processes
-            with (
-                patch("fastdeploy.engine.common_engine.EngineWorkerQueue") as FakeQ,
-                patch("fastdeploy.engine.common_engine.multiprocessing.Process") as FakeP,
-            ):
-                # Fake queue instances with cleanup
-                FakeQ.return_value = Mock(cleanup=lambda: None)
-
-                # When starting process, immediately mark the signal as 1 to break waiting loop
-                def start_side_effect(*args, **kwargs):
-                    # set value for dp id 1
-                    eng.launched_expert_service_signal.value[1] = 1
-
-                proc_instance = Mock(start=start_side_effect)
-                FakeP.return_value = proc_instance
-
-                # Avoid scheduler doing real work
-                eng.scheduler.start = lambda *a, **k: None
-                with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
-                    eng.launch_components()
-
-                # Verify expert service branch executed
-                self.assertTrue(hasattr(eng, "dp_processed"))
-                self.assertGreaterEqual(len(eng.dp_processed), 1)
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_check_worker_initialize_status_progress(self):
-        """Cover 1710-1762 by simulating stdout and ready signals."""
-        cfg = self._make_cfg(splitwise_role="mixed")
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        # Fake worker process stdout content that matches regexes
-        lines = [
-            b"Loading checkpoint shards: 1\n",
-            b"Start load layer 5\n",
-        ]
-
-        class DummyProc:
-            def __init__(self, it):
-                self._it = iter(it)
-
-            @property
-            def stdout(self):
-                return self._it
-
-            def poll(self):
-                return None
-
-        eng.worker_proc = DummyProc(lines)
-        eng.worker_init_status = {}
-        eng.cfg.model_config.num_hidden_layers = 8
-
-        # worker_ready_signal makes _worker_processes_ready() return True
-        class Sig:
-            def __init__(self):
-                self.value = np.array([1], dtype=np.int32)
-
-        eng.worker_ready_signal = Sig()
-
-        # Replace tqdm and sleep for fast execution
-        class DummyPbar:
-            def __init__(self):
-                self.n = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def update(self, delta=0, *args, **kwargs):
-                try:
-                    self.n += int(delta)
-                except Exception:
-                    self.n = 0
-
-            def refresh(self):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.tqdm", lambda *a, **k: DummyPbar()):
-            with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
-                ok = eng.check_worker_initialize_status()
-        self.assertTrue(ok)
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_worker_processes_ready_false(self):
-        """Cover line 1382 returning False."""
-        cfg = self._make_cfg()
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-
-        class Sig:
-            def __init__(self):
-                # less than worker_num_per_node
-                self.value = np.array([0], dtype=np.int32)
-
-        eng.worker_ready_signal = Sig()
-        self.assertFalse(eng._worker_processes_ready())
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_init_worker_signals_profile_iluvatar(self):
-        """Cover line 1434 by forcing iluvatar custom device and do_profile=True."""
-        # do_profile=True when num_gpu_blocks_override is None
-        cfg = self._make_cfg(num_gpu_blocks_override=None)
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                pass
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-        eng.ipc_signal_suffix = cfg.parallel_config.engine_worker_queue_port[0]
-        with patch("fastdeploy.engine.common_engine.paddle.is_compiled_with_custom_device", return_value=True):
-            eng._init_worker_signals()
-        # signal should exist
-        self.assertTrue(hasattr(eng, "get_profile_block_num_signal"))
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
-
-    def test_launch_components_dp_mode(self):
-        """Cover 1648-1652 branch for DP scheduler mode."""
-        # When ENABLE_V1_KVCACHE_SCHEDULER=1 the IPC cache-transfer protocol
-        # is no longer supported; force it to 0 here to avoid the
-        # NotImplementedError raised in EngineArgs.__post_init__ so we can
-        # still exercise the DP branch of launch_components.
-        with patch("fastdeploy.engine.args_utils.envs.ENABLE_V1_KVCACHE_SCHEDULER", 0):
-            cfg = self._make_cfg(
-                splitwise_role="prefill",
-                data_parallel_size=2,
-                scheduler_name="dp",
-            )
-
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
-            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
-        # Patch scheduler.start so it doesn't do heavy work
-        eng.scheduler.start = Mock()
-        eng.launch_components()
-        eng.scheduler.start.assert_called()
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+
+def test_add_requests_raises_on_stop_seqs_limits(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1], sampling_params=SamplingParams(min_tokens=1))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1]
+        request.stop_seqs_len = [5, 5]
+        return request
+
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+    monkeypatch.setattr(engine_module.envs, "FD_MAX_STOP_SEQS_NUM", 1)
+
+    with pytest.raises(EngineError):
+        engine.add_requests({"prompt": "hi"}, sampling_params=SamplingParams(min_tokens=1, max_tokens=6))
+
+
+def test_add_requests_raises_on_stop_seqs_length(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1], sampling_params=SamplingParams(min_tokens=1))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1]
+        request.stop_seqs_len = [10]
+        return request
+
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+    monkeypatch.setattr(engine_module.envs, "FD_STOP_SEQS_MAX_LEN", 5)
+    monkeypatch.setattr(engine_module.envs, "FD_MAX_STOP_SEQS_NUM", 10)
+
+    with pytest.raises(EngineError):
+        engine.add_requests({"prompt": "hi"}, sampling_params=SamplingParams(min_tokens=1, max_tokens=6))
+
+
+def test_add_requests_guided_decoding_requires_backend(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.guided_decoding_checker = None
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1], guided_json={"a": 1}, sampling_params=SamplingParams(min_tokens=1))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1]
+        return request
+
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+
+    with pytest.raises(EngineError):
+        engine.add_requests({"prompt": "hi"}, sampling_params=SamplingParams(min_tokens=1, max_tokens=6))
+
+
+def test_add_requests_guided_decoding_schema_error(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+
+    def fake_from_dict(task):
+        return DummyRequest(prompt_token_ids=[1], guided_json={"a": 1}, sampling_params=SamplingParams(min_tokens=1))
+
+    def fake_process_request(request, max_model_len, **kwargs):
+        request.prompt_token_ids = [1]
+        return request
+
+    engine.guided_decoding_checker = SimpleNamespace(schema_format=lambda request: (request, "bad schema"))
+    engine.engine = SimpleNamespace(
+        data_processor=SimpleNamespace(process_request=fake_process_request),
+        scheduler=SimpleNamespace(put_requests=lambda requests: None),
+    )
+    monkeypatch.setattr(engine_module.Request, "from_dict", fake_from_dict)
+
+    with pytest.raises(EngineError):
+        engine.add_requests({"prompt": "hi"}, sampling_params=SamplingParams(min_tokens=1, max_tokens=6))
+
+
+def test_worker_signals_and_ready(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.do_profile = True
+    engine.ipc_signal_suffix = "5555"
+    monkeypatch.setattr(engine_module, "IPCSignal", DummySignal)
+    monkeypatch.setattr(paddle, "is_compiled_with_custom_device", lambda name: False)
+
+    engine._init_worker_signals()
+    engine.worker_ready_signal.value[:] = 1
+    assert engine._worker_processes_ready() is True
+    engine.worker_ready_signal.value[:] = 0
+    assert engine._worker_processes_ready() is False
+
+
+def test_init_worker_signals_with_dp_and_profile(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.cfg.parallel_config.data_parallel_size = 2
+    engine.cfg.worker_num_per_node = 2
+    engine.cfg.nnode = 1
+    engine.do_profile = True
+    engine.ipc_signal_suffix = "5555"
+    monkeypatch.setattr(engine_module.envs, "FD_ENABLE_MULTI_API_SERVER", False)
+    monkeypatch.setattr(engine_module, "IPCSignal", DummySignal)
+    monkeypatch.setattr(paddle, "is_compiled_with_custom_device", lambda name: True)
+
+    engine._init_worker_signals()
+
+    assert engine.worker_ready_signal.value.shape[0] == 2
+    assert engine.launched_expert_service_signal.value.shape[0] == 2
+    assert engine.loaded_model_signal.value.shape[0] == 1
+    assert engine.get_profile_block_num_signal.value.shape[0] == 2
+
+
+def test_setting_environ_variables_includes_flags(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    monkeypatch.setattr(engine_module.envs, "ENABLE_V1_KVCACHE_SCHEDULER", True)
+    command_prefix = engine._setting_environ_variables()
+    assert "FLAGS_use_pd_disaggregation_per_chunk=1" in command_prefix
+    assert "FLAGS_fmt_write_cache_completed_signal=1" in command_prefix
+
+
+def test_setting_environ_variables_disaggregation_default(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    monkeypatch.setattr(engine_module.envs, "ENABLE_V1_KVCACHE_SCHEDULER", False)
+    command_prefix = engine._setting_environ_variables()
+    assert "FLAGS_use_pd_disaggregation=1" in command_prefix
+
+
+def test_start_worker_service_builds_command(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.do_profile = 0
+    tokenizer = DummyTokenizer()
+    data_processor = SimpleNamespace(tokenizer=tokenizer, eos_token_id_len=1, pad_token_id=0)
+    engine.engine = SimpleNamespace(data_processor=data_processor)
+    engine.data_processor = data_processor
+    engine._setting_environ_variables = lambda: "TEST_ENV=1"
+
+    captured = {}
+
+    def fake_popen(cmd, stdout, shell, preexec_fn):
+        captured["cmd"] = cmd
+        return SimpleNamespace(pid=1234, stdout=stdout)
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
+
+    process = engine._start_worker_service()
+
+    assert process.pid == 1234
+    assert "--max_model_len 8" in captured["cmd"]
+    assert "--engine_worker_queue_port 5555" in captured["cmd"]
+    assert "--log_dir" in captured["cmd"]
+
+
+def test_start_worker_service_no_think_token(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.do_profile = 0
+    tokenizer = SimpleNamespace(
+        vocab={"<|IMAGE_PLACEHOLDER|>": 11, "\n": 12},
+        get_vocab=lambda: {"<|IMAGE_PLACEHOLDER|>": 11, "\n": 12},
+    )
+    data_processor = SimpleNamespace(tokenizer=tokenizer, eos_token_id_len=1, pad_token_id=0)
+    engine.engine = SimpleNamespace(data_processor=data_processor)
+    engine.data_processor = data_processor
+    engine._setting_environ_variables = lambda: "TEST_ENV=1"
+
+    captured = {}
+
+    def fake_popen(cmd, stdout, shell, preexec_fn):
+        captured["cmd"] = cmd
+        return SimpleNamespace(pid=2222, stdout=stdout)
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
+
+    process = engine._start_worker_service()
+
+    assert process.pid == 2222
+    assert "--image_patch_id 11" in captured["cmd"]
+
+
+def test_start_worker_service_with_flags_and_iluvatar(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.cfg.parallel_config.enable_expert_parallel = True
+    engine.cfg.parallel_config.enable_chunked_moe = True
+    engine.cfg.cache_config.enable_chunked_prefill = True
+    engine.cfg.load_config.dynamic_load_weight = True
+    engine.cfg.structured_outputs_config.disable_any_whitespace = True
+    engine.cfg.parallel_config.disable_custom_all_reduce = True
+    engine.cfg.parallel_config.use_internode_ll_two_stage = True
+    engine.cfg.parallel_config.disable_sequence_parallel_moe = True
+    engine.cfg.model_config.enable_logprob = True
+    engine.cfg.model_config.lm_head_fp32 = True
+    engine.cfg.parallel_config.shutdown_comm_group_if_worker_idle = True
+    engine.cfg.model_config.enable_entropy = True
+    engine.cfg.cache_config.num_gpu_blocks_override = 4
+    engine.cfg.structured_outputs_config.logits_processors = ["a", "b"]
+    engine.cfg.ips = ["127.0.0.1", "127.0.0.2"]
+    engine.cfg.nnode = 2
+    engine.do_profile = 1
+    tokenizer = DummyTokenizer()
+    data_processor = SimpleNamespace(tokenizer=tokenizer, eos_token_id_len=1, pad_token_id=0)
+    engine.engine = SimpleNamespace(data_processor=data_processor)
+    engine.data_processor = data_processor
+    engine._setting_environ_variables = lambda: "TEST_ENV=1"
+    monkeypatch.setattr(engine_module.current_platform, "is_iluvatar", lambda: True)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    captured = {}
+
+    def fake_popen(cmd, stdout, shell, preexec_fn):
+        captured["cmd"] = cmd
+        return SimpleNamespace(pid=4321, stdout=stdout)
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
+
+    process = engine._start_worker_service()
+
+    assert process.pid == 4321
+    assert "--logits-processors a b" in captured["cmd"]
+    assert "--num_gpu_blocks_override 4" in captured["cmd"]
+    assert f"--devices {engine.cfg.parallel_config.device_ids}" not in captured["cmd"]
+
+
+def test_format_and_add_data_sets_context(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    captured = {}
+
+    def fake_add_requests(payload):
+        captured["payload"] = payload
+
+    engine.add_requests = fake_add_requests
+    request_id = engine._format_and_add_data(
+        {
+            "context": [
+                {"role": "system", "utterance": "system"},
+                {"role": "user", "utterance": "hi"},
+                {"role": "assistant", "utterance": "ok"},
+            ]
+        }
+    )
+
+    assert request_id == captured["payload"]["request_id"]
+    assert captured["payload"]["system"] == "system"
+    assert captured["payload"]["prompt"] == ["hi", "ok"]
+    assert captured["payload"]["max_tokens"] == engine.cfg.model_config.max_model_len
+
+
+def test_format_and_add_data_preserves_request_id(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    captured = {}
+
+    def fake_add_requests(payload):
+        captured["payload"] = payload
+
+    engine.add_requests = fake_add_requests
+    request_id = engine._format_and_add_data({"request_id": "fixed", "prompt": "hi"})
+
+    assert request_id == "fixed"
+    assert captured["payload"]["request_id"] == "fixed"
+
+
+def test_generate_handles_streaming(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine._format_and_add_data = lambda prompts: "req"
+    engine.engine = SimpleNamespace(check_and_free_block_tables=lambda: None)
+
+    class DummyOutput:
+        def __init__(self, text):
+            self.text = text
+
+        def to_dict(self):
+            return {"outputs": {"text": self.text, "reasoning_content": self.text}}
+
+    engine.engine.data_processor = SimpleNamespace(process_response=lambda result: DummyOutput(result.payload))
+
+    class Result:
+        def __init__(self, payload, finished):
+            self.payload = payload
+            self.finished = finished
+
+    def fake_get_generated_tokens(req_id):
+        return iter([Result("mid", False), Result("final", True)])
+
+    engine._get_generated_tokens = fake_get_generated_tokens
+
+    outputs = list(engine.generate({"prompt": "hi"}, stream=True))
+    assert outputs[0]["outputs"]["text"] == "mid"
+    assert outputs[1]["outputs"]["text"] == ""
+
+
+def test_generate_streaming_skips_none_processed():
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine._format_and_add_data = lambda prompts: "req"
+    engine.engine = SimpleNamespace(check_and_free_block_tables=lambda: None)
+
+    engine.engine.data_processor = SimpleNamespace(
+        process_response=lambda result: (
+            None
+            if result.payload == "skip"
+            else SimpleNamespace(to_dict=lambda: {"outputs": {"text": "done", "reasoning_content": "done"}})
+        )
+    )
+
+    class Result:
+        def __init__(self, payload, finished):
+            self.payload = payload
+            self.finished = finished
+
+    engine._get_generated_tokens = lambda req_id: iter([Result("skip", False), Result("done", True)])
+
+    outputs = list(engine.generate({"prompt": "hi"}, stream=True))
+    assert outputs[-1]["outputs"]["text"] == ""
+
+
+def test_generate_non_streaming_and_none_processed(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine._format_and_add_data = lambda prompts: "req"
+    engine.engine = SimpleNamespace(check_and_free_block_tables=lambda: None)
+
+    class DummyOutput:
+        def __init__(self, text):
+            self.text = text
+
+        def to_dict(self):
+            return {"outputs": {"text": self.text, "reasoning_content": self.text}}
+
+    def process_response(result):
+        if result.payload == "skip":
+            return None
+        return DummyOutput(result.payload)
+
+    engine.engine.data_processor = SimpleNamespace(process_response=process_response)
+
+    class Result:
+        def __init__(self, payload, finished):
+            self.payload = payload
+            self.finished = finished
+
+    def fake_get_generated_tokens(req_id):
+        return iter([Result("skip", False), Result("final", True)])
+
+    engine._get_generated_tokens = fake_get_generated_tokens
+
+    outputs = list(engine.generate({"prompt": "hi"}, stream=False))
+    assert outputs[0]["outputs"]["text"] == "final"
+
+
+def test_generate_handles_add_request_error():
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine._format_and_add_data = lambda prompts: (_ for _ in ()).throw(ValueError("bad"))
+
+    with pytest.raises(EngineError) as excinfo:
+        list(engine.generate({"prompt": "hi"}, stream=False))
+    assert excinfo.value.error_code == 400
+
+
+def test_stop_profile_resets_cache_config(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.do_profile = 1
+    engine.ipc_signal_suffix = "5555"
+    engine.get_profile_block_num_signal = SimpleNamespace(value=np.array([2], dtype=np.int32))
+    engine.engine = SimpleNamespace(
+        resource_manager=SimpleNamespace(reset_cache_config=lambda config: None),
+        start_cache_service=lambda device_ids, suffix: ["cache"],
+    )
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+
+    engine._stop_profile()
+
+    assert engine.do_profile == 0
+    assert engine.cfg.cache_config.reset_called_with == 2
+
+
+def test_stop_profile_waits_for_signal(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.do_profile = 1
+    engine.ipc_signal_suffix = "5555"
+    signal = SimpleNamespace(value=np.array([0], dtype=np.int32))
+    engine.get_profile_block_num_signal = signal
+    engine.engine = SimpleNamespace(
+        resource_manager=SimpleNamespace(reset_cache_config=lambda config: None),
+        start_cache_service=lambda device_ids, suffix: ["cache"],
+    )
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+
+    def fake_sleep(_):
+        signal.value[0] = 3
+
+    monkeypatch.setattr(engine_module.time, "sleep", fake_sleep)
+
+    engine._stop_profile()
+    assert engine.cfg.cache_config.reset_called_with == 3
+
+
+def test_check_health_detects_stale_worker():
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.engine = SimpleNamespace(worker_healthy_live_signal=SimpleNamespace(value=np.array([0.0])))
+    ok, message = engine.check_health()
+    assert ok is True
+    assert message == ""
+    engine.engine.worker_healthy_live_signal.value[0] = time.time() - 40
+    ok, message = engine.check_health(time_interval_threashold=30)
+    assert ok is False
+    assert message == "Worker Service Not Healthy"
+
+
+def test_get_generated_result():
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.engine = SimpleNamespace(scheduler=SimpleNamespace(get_results=lambda: ["result"]))
+    assert engine._get_generated_result() == ["result"]
+
+
+def test_start_profile_flow(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.is_started = False
+    engine.do_profile = 1
+
+    def fake_init_worker_signals():
+        engine.loaded_model_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    engine._init_worker_signals = fake_init_worker_signals
+    engine.launch_components = lambda: None
+    engine.engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: ["cache"],
+        start_zmq_service=lambda pid: None,
+    )
+    engine._start_worker_service = lambda: SimpleNamespace(pid=1, stdout=None)
+    engine.check_worker_initialize_status = lambda: True
+    engine._stop_profile = lambda: setattr(engine, "profile_stopped", True)
+    monkeypatch.setattr(engine_module.envs, "ENABLE_V1_KVCACHE_SCHEDULER", True)
+    monkeypatch.setattr(engine_module.envs, "FD_ENABLE_INTERNAL_ADAPTER", True)
+    monkeypatch.setattr(engine_module.envs, "FD_ZMQ_RECV_REQUEST_SERVER_PORTS", "1111,2222")
+    monkeypatch.setattr(engine_module.envs, "FD_ZMQ_SEND_RESPONSE_SERVER_PORTS", "3333,4444")
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.start(api_server_pid=123) is True
+    assert engine.profile_stopped is True
+    assert engine_module.envs.FD_ZMQ_RECV_REQUEST_SERVER_PORT == "1111"
+    assert engine_module.envs.FD_ZMQ_SEND_RESPONSE_SERVER_PORT == "3333"
+
+
+def test_start_returns_false_when_worker_init_fails(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.is_started = False
+    engine.do_profile = 0
+
+    def fake_init_worker_signals():
+        engine.loaded_model_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    engine._init_worker_signals = fake_init_worker_signals
+    engine.launch_components = lambda: None
+    engine.engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: ["cache"],
+    )
+    engine._start_worker_service = lambda: SimpleNamespace(pid=1, stdout=None)
+    engine.check_worker_initialize_status = lambda: False
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.start() is False
+
+
+def test_start_waits_for_loaded_model(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.is_started = False
+    engine.do_profile = 0
+    engine.loaded_model_signal = SimpleNamespace(value=np.array([0], dtype=np.int32))
+    done = {}
+
+    def fake_init_worker_signals():
+        engine.loaded_model_signal = SimpleNamespace(value=np.array([0], dtype=np.int32))
+
+    def check_worker_initialize_status():
+        while engine.loaded_model_signal.value[0] == 0:
+            time.sleep(0.01)
+        return True
+
+    call_count = {"count": 0}
+
+    def fake_sleep(_):
+        call_count["count"] += 1
+        if call_count["count"] > 1:
+            engine.loaded_model_signal.value[0] = 1
+        done["slept"] = True
+
+    engine._init_worker_signals = fake_init_worker_signals
+    engine.launch_components = lambda: None
+    engine.engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: ["cache"],
+    )
+    engine._start_worker_service = lambda: SimpleNamespace(pid=1, stdout=None)
+    engine.check_worker_initialize_status = check_worker_initialize_status
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+    monkeypatch.setattr(engine_module.time, "sleep", fake_sleep)
+
+    assert engine.start() is True
+    assert done["slept"] is True
+
+
+def test_start_cache_service_before_workers(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    engine.is_started = False
+    engine.do_profile = 0
+
+    def fake_init_worker_signals():
+        engine.loaded_model_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    engine._init_worker_signals = fake_init_worker_signals
+    engine.launch_components = lambda: None
+    called = {}
+    engine.engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: called.setdefault("cache", device_ids),
+    )
+    engine._start_worker_service = lambda: SimpleNamespace(pid=1, stdout=None)
+    engine.check_worker_initialize_status = lambda: True
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.start() is True
+    assert called["cache"] == ["0"]
+
+
+def test_start_cache_service_mixed_after_profile(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="mixed")
+    engine.is_started = False
+    engine.do_profile = 0
+    engine.cfg.cache_config.enable_prefix_caching = True
+
+    def fake_init_worker_signals():
+        engine.loaded_model_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    engine._init_worker_signals = fake_init_worker_signals
+    engine.launch_components = lambda: None
+    called = {}
+    engine.engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: called.setdefault("cache", device_ids),
+    )
+    engine._start_worker_service = lambda: SimpleNamespace(pid=1, stdout=None)
+    engine.check_worker_initialize_status = lambda: True
+    monkeypatch.setattr(engine_module.current_platform, "is_intel_hpu", lambda: False)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.start() is True
+    assert called["cache"] == ["0"]
+
+
+def test_launch_components_splitwise_and_dp(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    engine.cfg.scheduler_config.name = "dp"
+    engine.cfg.parallel_config.data_parallel_size = 2
+    engine.cfg.parallel_config.engine_worker_queue_port = [6000, 6001]
+    engine.cfg.worker_num_per_node = 1
+    engine.cfg.node_rank = 0
+    engine.cfg.nnode = 1
+    engine.cfg.master_ip = "127.0.0.1"
+    engine.launched_expert_service_signal = SimpleNamespace(value=np.array([0, 1], dtype=np.int32))
+
+    engine.engine = SimpleNamespace(
+        split_connector=SimpleNamespace(start_receiver=lambda: None),
+        scheduler=SimpleNamespace(start=lambda *args: None),
+    )
+
+    class DummyQueue:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyProcess:
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pass
+
+    class DummyContext:
+        def Process(self, target, args):
+            return DummyProcess(target, args)
+
+    monkeypatch.setattr(engine_module.multiprocessing, "Queue", DummyQueue)
+    monkeypatch.setattr(engine_module.multiprocessing, "get_context", lambda name: DummyContext())
+    monkeypatch.setattr(engine_module, "EngineWorkerQueue", lambda **kwargs: SimpleNamespace(cleanup=lambda: None))
+    monkeypatch.setattr(engine_module.envs, "FD_ENABLE_MULTI_API_SERVER", False)
+    monkeypatch.setattr(engine_module.envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", False)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    engine.launch_components()
+
+    assert len(engine.dp_processed) == 1
+    assert len(engine.dp_engine_worker_queue_server) == 1
+
+
+def test_launch_components_splitwise_name(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    engine.cfg.scheduler_config.name = "splitwise"
+    engine.engine = SimpleNamespace(
+        split_connector=SimpleNamespace(start_receiver=lambda: None),
+        scheduler=SimpleNamespace(start=lambda *args: args),
+    )
+
+    called = {}
+
+    def start_scheduler(*args):
+        called["args"] = args
+
+    engine.engine.scheduler.start = start_scheduler
+    monkeypatch.setattr(engine_module.envs, "FD_ENABLE_MULTI_API_SERVER", True)
+
+    engine.launch_components()
+    assert called["args"][0] == "prefill"
+
+
+def test_launch_components_queue_shm(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg(splitwise_role="prefill")
+    engine.cfg.scheduler_config.name = "dp"
+    engine.cfg.parallel_config.data_parallel_size = 2
+    engine.cfg.parallel_config.engine_worker_queue_port = [7000, 7001]
+    engine.cfg.worker_num_per_node = 1
+    engine.cfg.node_rank = 0
+    engine.cfg.nnode = 1
+    engine.cfg.master_ip = "127.0.0.1"
+    engine.launched_expert_service_signal = SimpleNamespace(value=np.array([0, 0], dtype=np.int32))
+
+    engine.engine = SimpleNamespace(
+        split_connector=SimpleNamespace(start_receiver=lambda: None),
+        scheduler=SimpleNamespace(start=lambda *args: None),
+    )
+
+    class DummyQueue:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyProcess:
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pass
+
+    class DummyContext:
+        def Process(self, target, args):
+            return DummyProcess(target, args)
+
+    captured = {}
+
+    def fake_queue(**kwargs):
+        captured["address"] = kwargs["address"]
+        return SimpleNamespace(cleanup=lambda: None)
+
+    def fake_sleep(_):
+        engine.launched_expert_service_signal.value[1] = 1
+
+    monkeypatch.setattr(engine_module.multiprocessing, "Queue", DummyQueue)
+    monkeypatch.setattr(engine_module.multiprocessing, "get_context", lambda name: DummyContext())
+    monkeypatch.setattr(engine_module, "EngineWorkerQueue", fake_queue)
+    monkeypatch.setattr(engine_module.envs, "FD_ENABLE_MULTI_API_SERVER", False)
+    monkeypatch.setattr(engine_module.envs, "FD_ENGINE_TASK_QUEUE_WITH_SHM", True)
+    monkeypatch.setattr(engine_module.time, "sleep", fake_sleep)
+
+    engine.launch_components()
+
+    assert captured["address"] == "/dev/shm/fd_task_queue_7001.sock"
+
+
+def test_check_worker_initialize_status_progress(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.worker_init_status = {}
+    engine.worker_ready_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    stdout_lines = [
+        b"Loading checkpoint shards: 50",
+        b"Start load layer 2",
+    ]
+
+    class DummyProc:
+        def __init__(self, lines):
+            self.stdout = list(lines)
+
+        def poll(self):
+            return None
+
+    engine.worker_proc = DummyProc(stdout_lines)
+
+    class DummyPbar:
+        def __init__(self, total, desc):
+            self.total = total
+            self.n = 0
+
+        def update(self, value):
+            self.n += value
+
+        def refresh(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(engine_module, "tqdm", lambda total, desc: DummyPbar(total, desc))
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.check_worker_initialize_status() is True
+    assert engine.worker_init_status["finished"] is True
+
+
+def test_check_worker_initialize_status_early_finish(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.worker_init_status = {"finished": True, "weight_loadding": 1, "layer_loadding": 1}
+    engine.worker_ready_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    class DummyProc:
+        def __init__(self):
+            self.stdout = [b"done"]
+
+        def poll(self):
+            return None
+
+    engine.worker_proc = DummyProc()
+
+    class DummyPbar:
+        def __init__(self, total, desc):
+            self.n = 0
+
+        def update(self, value):
+            self.n += value
+
+        def refresh(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(engine_module, "tqdm", lambda total, desc: DummyPbar(total, desc))
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.check_worker_initialize_status() is True
+
+
+def test_check_worker_initialize_status_poll_failures(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.worker_init_status = {}
+    engine.worker_ready_signal = SimpleNamespace(value=np.array([0], dtype=np.int32))
+
+    class DummyProc:
+        def __init__(self):
+            self.stdout = []
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if self.calls == 1:
+                return 1
+            return None
+
+    engine.worker_proc = DummyProc()
+
+    class DummyPbar:
+        def __init__(self, total, desc):
+            self.n = 0
+
+        def update(self, value):
+            self.n += value
+
+        def refresh(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(engine_module, "tqdm", lambda total, desc: DummyPbar(total, desc))
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.check_worker_initialize_status() is False
+
+
+def test_check_worker_initialize_status_join_exception(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.cfg = build_cfg()
+    engine.worker_init_status = {"weight_loadding": 1, "layer_loadding": 1}
+    engine.worker_ready_signal = SimpleNamespace(value=np.array([1], dtype=np.int32))
+
+    class DummyProc:
+        def __init__(self):
+            self.stdout = []
+
+        def poll(self):
+            return None
+
+    engine.worker_proc = DummyProc()
+
+    class DummyThread:
+        def __init__(self, target, daemon):
+            self._target = target
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            raise RuntimeError("join failed")
+
+    monkeypatch.setattr(engine_module.threading, "Thread", DummyThread)
+
+    class DummyPbar:
+        def __init__(self, total, desc):
+            self.n = 0
+
+        def update(self, value):
+            self.n += value
+
+        def refresh(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(engine_module, "tqdm", lambda total, desc: DummyPbar(total, desc))
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    assert engine.check_worker_initialize_status() is True
+
+
+def test_exit_sub_services_cleans_resources(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.running = True
+    engine.worker_ready_signal = DummySignal("worker", np.zeros([1], dtype=np.int32), np.int32, "s", True)
+    engine.loaded_model_signal = DummySignal("loaded", np.zeros([1], dtype=np.int32), np.int32, "s", True)
+    engine.get_profile_block_num_signal = DummySignal("profile", np.zeros([1], dtype=np.int32), np.int32, "s", True)
+
+    cache_manager = SimpleNamespace(
+        shm_cache_task_flag_broadcast=SimpleNamespace(clear=lambda: None),
+        cache_ready_signal=SimpleNamespace(clear=lambda: None),
+    )
+    engine.engine = SimpleNamespace(resource_manager=SimpleNamespace(cache_manager=cache_manager))
+    engine.cache_manager_processes = [SimpleNamespace(pid=10)]
+    engine.worker_proc = SimpleNamespace(pid=20)
+    engine.zmq_server = SimpleNamespace(close=lambda: None)
+    engine.dp_processed = [SimpleNamespace(pid=30, join=lambda: None)]
+    engine.dp_engine_worker_queue_server = [SimpleNamespace(cleanup=lambda: None)]
+
+    monkeypatch.setattr(engine_module.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(engine_module.os, "killpg", lambda pid, sig: None)
+
+    engine._exit_sub_services()
+
+    assert engine.running is False
+    assert engine.worker_ready_signal.cleared is True
+    assert engine.loaded_model_signal.cleared is True
+
+
+def test_exit_sub_services_handles_kill_errors(monkeypatch):
+    engine = engine_module.LLMEngine.__new__(engine_module.LLMEngine)
+    engine.running = True
+    engine.worker_ready_signal = DummySignal("worker", np.zeros([1], dtype=np.int32), np.int32, "s", True)
+    engine.loaded_model_signal = DummySignal("loaded", np.zeros([1], dtype=np.int32), np.int32, "s", True)
+    engine.cache_manager_processes = [SimpleNamespace(pid=10)]
+    engine.engine = SimpleNamespace(resource_manager=SimpleNamespace(cache_manager=SimpleNamespace()))
+    engine.worker_proc = SimpleNamespace(pid=20)
+
+    def raise_error(_):
+        raise OSError("fail")
+
+    monkeypatch.setattr(engine_module.os, "getpgid", raise_error)
+    monkeypatch.setattr(engine_module.os, "killpg", lambda pid, sig: None)
+
+    engine._exit_sub_services()
+
+    assert engine.running is False
