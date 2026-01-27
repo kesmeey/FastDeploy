@@ -692,7 +692,12 @@ def test_launch_non_mixed_mode_starts_cache_manager(monkeypatch):
 
     # Mock cache manager processes
     mock_cache_processes = [DummyProcess(pid=123)]
-    mock_engine = SimpleNamespace(start_cache_service=lambda device_ids, suffix: mock_cache_processes)
+    mock_engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
+        start_cache_service=lambda device_ids, suffix: mock_cache_processes,
+    )
 
     monkeypatch.setattr(engine_module, "current_platform", SimpleNamespace(is_intel_hpu=lambda: False))
     monkeypatch.setattr(engine, "engine", mock_engine)
@@ -729,6 +734,9 @@ def test_launch_mixed_mode_starts_cache_manager_after_profile(monkeypatch):
     # Mock cache manager processes
     mock_cache_processes = [DummyProcess(pid=789)]
     mock_engine = SimpleNamespace(
+        start=lambda: None,
+        create_data_processor=lambda: None,
+        data_processor=SimpleNamespace(),
         start_cache_service=lambda device_ids, suffix: mock_cache_processes,
         scheduler=SimpleNamespace(start=lambda *args: None),
     )
