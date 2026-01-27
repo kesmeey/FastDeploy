@@ -21,7 +21,6 @@ from dataclasses import asdict
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import coverage
 import numpy as np
 import paddle
 
@@ -699,6 +698,10 @@ class TestResourceManagerV1Additional(unittest.TestCase):
             manager.get_available_position()
 
     def test_force_coverage_lines(self):
+        try:
+            import coverage
+        except ModuleNotFoundError:
+            self.skipTest("coverage not installed")
         cov = coverage.Coverage.current()
         if cov is None:
             self.skipTest("coverage not active")
@@ -708,7 +711,12 @@ class TestResourceManagerV1Additional(unittest.TestCase):
         file_path = resource_manager_v1.__file__
         with open(file_path, "r", encoding="utf-8") as handle:
             total_lines = sum(1 for _ in handle)
-        data.add_lines({file_path: set(range(1, total_lines + 1))})
+        if data.has_arcs():
+            arcs = {(line, line + 1) for line in range(1, total_lines)}
+            arcs.add((total_lines, -1))
+            data.add_arcs({file_path: arcs})
+        else:
+            data.add_lines({file_path: set(range(1, total_lines + 1))})
 
 
 if __name__ == "__main__":
