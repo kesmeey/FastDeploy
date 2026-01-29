@@ -14,6 +14,7 @@
 
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -185,6 +186,34 @@ class TestCacheTransferManager(unittest.TestCase):
         self.assertEqual(args.cache_dtype, "bfloat16")
         self.assertEqual(args.write_policy, "write_through")
 
+    def test_init_storage_invalid_backend_logs_error(self):
+        class LocalArgs(Args):
+            kvcache_storage_backend = "unknown"
+
+        with (
+            patch.object(CacheTransferManager, "_init_cpu_cache", lambda self, args: None),
+            patch.object(CacheTransferManager, "_init_gpu_cache", lambda self, args: None),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.console_logger") as mock_console,
+        ):
+            with self.assertRaises(NotImplementedError):
+                CacheTransferManager(LocalArgs())
+
+        self.assertTrue(cache_transfer_manager.logger.error.called)
+        mock_console.error.assert_called_once()
+
+    def test_init_storage_sets_key_prefix_from_version(self):
+        args = Args()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            version_path = os.path.join(tmpdir, "version.yaml")
+            with open(version_path, "w", encoding="utf-8") as handle:
+                handle.write("version: RL-STEP03-20250101-uuid\n")
+            args.model_path = tmpdir
+            args.kvcache_storage_backend = None
+
+            self.manager._init_storage(args)
+
+        self.assertEqual(self.manager.key_prefix, "RL-STEP03")
+
     # ==========================
     # do_data_transfer 异常处理测试
     # ==========================
@@ -205,6 +234,75 @@ class TestCacheTransferManager(unittest.TestCase):
         self.assertGreaterEqual(self.manager.check_work_status.call_count, 1)
         self.assertGreaterEqual(cache_transfer_manager.logger.error.call_count, 1)
         self.assertGreaterEqual(cache_transfer_manager.logger.critical.call_count, 1)
+
+    def test_do_data_transfer_barriers_swap2gpu_then_idle(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = [value]
+
+        self.manager.rank = 0
+        self.manager.n_ranks = 2
+        self.manager.cache_task_broadcast_signal = DummySignal(0)
+        self.manager.cache_task_queue.empty.side_effect = [False, True]
+        self.manager.cache_task_queue.get_transfer_task.side_effect = [
+            ((cache_transfer_manager.CacheStatus.SWAP2GPU, 1, [0], [1], [2]), True)
+        ]
+        self.manager.cache_task_queue.barrier1 = MagicMock()
+        self.manager.cache_task_queue.barrier2 = MagicMock()
+        self.manager.cache_task_queue.barrier3 = MagicMock()
+        self.manager.cache_task_queue.barrier2.reset.side_effect = SystemExit
+        self.manager.swap_to_gpu_thread_pool.submit = MagicMock()
+
+        with self.assertRaises(SystemExit):
+            self.manager.do_data_transfer()
+
+        self.manager.swap_to_gpu_thread_pool.submit.assert_called_once()
+        self.assertEqual(self.manager.cache_task_broadcast_signal.value[0], 0)
+        self.manager.cache_task_queue.barrier1.wait.assert_called()
+        self.manager.cache_task_queue.barrier3.reset.assert_called_once()
+        self.manager.cache_task_queue.barrier2.wait.assert_called_once()
+
+    def test_do_data_transfer_broken_pipe_check_status_exception(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = [value]
+
+        self.manager.rank = 0
+        self.manager.n_ranks = 1
+        self.manager.cache_task_broadcast_signal = DummySignal(1)
+        self.manager.cache_task_queue.get_transfer_task.side_effect = [
+            BrokenPipeError("boom"),
+            SystemExit,
+        ]
+        self.manager.check_work_status = MagicMock(side_effect=RuntimeError("status failed"))
+
+        with (
+            patch("fastdeploy.cache_manager.cache_transfer_manager.envs.FD_CACHE_PROC_ERROR_COUNT", 0),
+            patch("time.sleep", MagicMock()),
+        ):
+            with self.assertRaises(SystemExit):
+                self.manager.do_data_transfer()
+
+        self.assertGreaterEqual(cache_transfer_manager.logger.error.call_count, 1)
+
+    def test_do_data_transfer_generic_exception_logs(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = [value]
+
+        self.manager.rank = 0
+        self.manager.n_ranks = 1
+        self.manager.cache_task_broadcast_signal = DummySignal(1)
+        self.manager.cache_task_queue.get_transfer_task.side_effect = [
+            RuntimeError("oops"),
+            SystemExit,
+        ]
+
+        with patch.object(cache_transfer_manager.logger, "info") as mock_info:
+            with self.assertRaises(SystemExit):
+                self.manager.do_data_transfer()
+
+        mock_info.assert_called()
 
     # ==========================
     # 工具函数与存储相关测试
@@ -254,6 +352,22 @@ class TestCacheTransferManager(unittest.TestCase):
             1,
         )
 
+    def test_run_read_storage_mooncake_error_raises(self):
+        self.manager.storage_backend = MagicMock()
+        self.manager.storage_backend_type = "mooncake"
+        self.manager.storage_key_read_buffer = 100
+        self.manager.storage_value_read_buffer = 200
+        self.manager.storage_buffer_stride_bytes = 10
+        self.manager.key_cache_shape = [1, 1, 1, 1]
+        self.manager.value_cache_shape = [1, 1, 1, 1]
+        self.manager.device = 0
+        self.manager.gpu_cache_k_tensors = [paddle.zeros([1])]
+        self.manager.gpu_cache_v_tensors = [paddle.zeros([1])]
+        self.manager.storage_backend.batch_get.side_effect = RuntimeError("read error")
+
+        with self.assertRaises(RuntimeError):
+            self.manager._run_read_storage("task", [1], 0, ["k1"], ["v1"], [0], [0], 0.1)
+
     def test_read_storage_task_reports_result(self):
         self.manager.cache_task_queue.swap_storage_to_gpu_barrier = MagicMock()
         self.manager.cache_task_queue.put_transfer_done_signal = MagicMock()
@@ -277,13 +391,40 @@ class TestCacheTransferManager(unittest.TestCase):
         self.manager.read_storage_task(task)
 
         self.manager._run_read_storage.assert_called_once_with(
-            "7", [1, 2], 0, ["a_key_0", "b_key_0"], ["a_value_0", "b_value_0"], [3, 4], [0, 1], 0.2
+            "7",
+            [1, 2],
+            0,
+            ["prefix_a_0_key", "prefix_b_0_key"],
+            ["prefix_a_0_value", "prefix_b_0_value"],
+            [3, 4],
+            [0, 1],
+            0.2,
         )
         self.manager.cache_task_queue.swap_storage_to_gpu_barrier.wait.assert_called_once()
         self.manager.cache_task_queue.swap_storage_to_gpu_barrier.reset.assert_called_once()
         self.manager.cache_task_queue.put_transfer_done_signal.assert_called_once_with(
             (cache_transfer_manager.CacheStatus.STORAGE2GPU, "7", ["a", "b", "c"], [3])
         )
+
+    def test_read_storage_task_exception_logs(self):
+        self.manager.cache_task_queue.swap_storage_to_gpu_barrier = MagicMock()
+        self.manager.cache_task_queue.swap_storage_to_gpu_barrier.wait.side_effect = RuntimeError("barrier error")
+        self.manager.storage_backend = MagicMock()
+        self.manager.storage_backend_type = "attention_store"
+        self.manager.storage_backend.query.return_value = 0
+
+        task = ReadStorageTask(
+            task_id="read_error",
+            keys=["k1"],
+            token_ids=[1, 2],
+            gpu_block_ids=[0],
+            start_read_block_idx=0,
+            timeout=0.1,
+        )
+
+        self.manager.read_storage_task(task)
+
+        self.assertGreaterEqual(cache_transfer_manager.logger.error.call_count, 1)
 
     def test_write_back_storage_task_skips_cached_keys(self):
         self.manager.cache_task_queue.swap_to_storage_barrier = MagicMock()
@@ -443,6 +584,46 @@ class TestCacheTransferManager(unittest.TestCase):
         self.assertIn("key_cache_scales_0_rank0.device0", manager.gpu_cache_kvs)
         self.assertIn("value_cache_scales_0_rank0.device0", manager.gpu_cache_kvs)
 
+    def test_init_gpu_cache_waits_for_ready_signal(self):
+        class LocalArgs(Args):
+            create_cache_tensor = False
+            cache_dtype = "bfloat16"
+            num_layers = 1
+            key_cache_shape = "1,1,1,1"
+            value_cache_shape = "1,1,1,1"
+
+        with (
+            patch.object(CacheTransferManager, "_init_cpu_cache", lambda self, args: None),
+            patch.object(CacheTransferManager, "_init_gpu_cache", lambda self, args: None),
+        ):
+            manager = CacheTransferManager(LocalArgs())
+
+        class DummySignal:
+            def __init__(self, value):
+                self.value = [value]
+
+        manager.cache_ready_signal = DummySignal(0)
+        manager.gpu_cache_kvs = {}
+        manager.gpu_cache_k_tensors = []
+        manager.gpu_cache_v_tensors = []
+
+        def fake_share(tensor, name, shape, _):
+            return paddle.zeros(shape=shape, dtype=tensor.dtype)
+
+        def fake_sleep(_):
+            manager.cache_ready_signal.value[0] = 1
+
+        with (
+            patch("fastdeploy.cache_manager.cache_transfer_manager.time.sleep", side_effect=fake_sleep),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.set_device"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.share_external_data_", side_effect=fake_share),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.memory_allocated", return_value=0),
+        ):
+            self._orig_init_gpu_cache(manager, LocalArgs())
+
+        self.assertIn("key_caches_0_rank0.device0", manager.gpu_cache_kvs)
+        self.assertIn("value_caches_0_rank0.device0", manager.gpu_cache_kvs)
+
     def test_init_storage_buffer_registers_buffers(self):
         class DummyStorage:
             def __init__(self):
@@ -532,10 +713,18 @@ class TestCacheTransferManager(unittest.TestCase):
         self.manager.write_back_storage_task(task)
 
         self.manager._run_write_back_storage.assert_called_once_with(
-            "9", [1, 2], 0, ["k1_key_1"], ["k1_value_1"], [0], [0], 0.1
+            "9", [1, 2], 0, ["prefix_k1_1_key"], ["prefix_k1_1_value"], [0], [0], 0.1
         )
         self.manager.cache_task_queue.swap_to_storage_barrier.wait.assert_called_once()
         self.manager.cache_task_queue.put_transfer_done_signal.assert_not_called()
+
+    def test_get_key_prefix_from_version(self):
+        with patch("fastdeploy.cache_manager.cache_transfer_manager.yaml.safe_load") as mock_load:
+            mock_load.return_value = {"version": "RL-STEP02-20250101-uuid"}
+            with patch("builtins.open", unittest.mock.mock_open(read_data="version: RL-STEP02-20250101-uuid")):
+                key_prefix = cache_transfer_manager.get_key_prefix_from_version("fake_path/version.yaml")
+
+        self.assertEqual(key_prefix, "RL-STEP02")
 
     def test_run_write_back_storage_sets_backend(self):
         self.manager.storage_backend = MagicMock()
@@ -565,6 +754,23 @@ class TestCacheTransferManager(unittest.TestCase):
             target_locations=[3000, 4000],
             target_sizes=[self.manager.storage_buffer_stride_bytes] * 2,
         )
+
+    def test_run_write_back_storage_error_returns_zero(self):
+        self.manager.storage_backend = MagicMock()
+        self.manager.storage_backend_type = "mooncake"
+        self.manager.storage_key_write_buffer = 3000
+        self.manager.storage_value_write_buffer = 4000
+        self.manager.storage_buffer_stride_bytes = 8
+        self.manager.key_cache_shape = [2, 1, 1, 1]
+        self.manager.gpu_cache_k_tensors = [paddle.zeros([1])]
+        self.manager.gpu_cache_v_tensors = [paddle.zeros([1])]
+        self.manager.device = 0
+        self.manager.storage_backend.batch_set.side_effect = RuntimeError("write error")
+
+        with patch("fastdeploy.cache_manager.cache_transfer_manager.swap_cache_layout"):
+            result = self.manager._run_write_back_storage("task", [1, 2], 0, ["k1"], ["v1"], [0], [0], 0.1)
+
+        self.assertEqual(result, 0)
 
     def test_run_read_storage_attention_store(self):
         self.manager.storage_backend = MagicMock()
@@ -666,6 +872,25 @@ class TestCacheTransferManager(unittest.TestCase):
             (cache_transfer_manager.CacheStatus.GPU2STORAGE, "write_fail", ["k1"], [])
         )
 
+    def test_write_back_storage_task_exception_logs(self):
+        self.manager.cache_task_queue.swap_to_storage_barrier = MagicMock()
+        self.manager.cache_task_queue.swap_to_storage_barrier.wait.side_effect = RuntimeError("barrier error")
+        self.manager.storage_backend = MagicMock()
+        self.manager.storage_backend_type = "attention_store"
+        self.manager.storage_backend.query.return_value = 0
+
+        task = WriteStorageTask(
+            task_id="write_error",
+            keys=["k1"],
+            token_ids=[1, 2],
+            gpu_block_ids=[0],
+            timeout=0.1,
+        )
+
+        self.manager.write_back_storage_task(task)
+
+        self.assertGreaterEqual(cache_transfer_manager.logger.error.call_count, 1)
+
     # ==========================
     # transfer_data 分支测试
     # ==========================
@@ -721,6 +946,15 @@ class TestCacheTransferManager(unittest.TestCase):
             result = self.manager._transfer_data([1], [2], [3], dummy_event, transfer_task_id=9)
         self.assertEqual(result[0], dummy_event)
         mock_warning.assert_called_once()
+
+    def test_transfer_data_length_mismatch_logs_error(self):
+        self.manager.cache_dtype = "bfloat16"
+        event_type = cache_transfer_manager.CacheStatus.SWAP2CPU
+        with patch.object(cache_transfer_manager.logger, "error") as mock_error:
+            with self.assertRaises(AssertionError):
+                self.manager._transfer_data([0], [0], [0, 1], event_type, transfer_task_id=5)
+
+        mock_error.assert_called_once()
 
     def test_do_swap_tasks_signal_and_return(self):
         self.manager.cache_task_queue.swap_to_cpu_barrier1 = MagicMock()
@@ -819,6 +1053,57 @@ class TestCacheTransferManager(unittest.TestCase):
         self.assertEqual(self.manager.gpu_cache_kvs, {})
         mock_empty.assert_called_once()
 
+    def test_check_cache_status_clearing_with_swap_space_clear(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = value
+
+        args = Args()
+        args.splitwise_role = "mixed"
+        args.create_cache_tensor = True
+        args.mp_num = 2
+        self.manager.kv_cache_status_signal = DummySignal([cache_transfer_manager.KVCacheStatus.CLEARING])
+        self.manager.cache_ready_signal = DummySignal([1, 1])
+        self.manager.swap_space_ready_signal = DummySignal([0, 0])
+        self.manager.num_cpu_blocks = 1
+        self.manager.cache_dtype = "block_wise_fp8"
+        self.manager.k_dst_ptrs = [101]
+        self.manager.v_dst_ptrs = [202]
+        self.manager.k_scales_ptrs = [303]
+        self.manager.v_scales_ptrs = [404]
+        self.manager.cpu_cache_kvs = {"k": 101, "v": 202}
+        self.manager.gpu_cache_kvs = {"k": paddle.zeros([1])}
+        self.manager.gpu_cache_k_tensors = [paddle.zeros([1])]
+        self.manager.gpu_cache_v_tensors = [paddle.zeros([1])]
+        self.manager.gpu_cache_scales_k_tensors = [paddle.zeros([1])]
+        self.manager.gpu_cache_scales_v_tensors = [paddle.zeros([1])]
+
+        sleep_calls = {"count": 0}
+
+        def fake_sleep(_):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] == 1:
+                self.manager.cache_ready_signal.value[0] = 0
+            elif sleep_calls["count"] == 2:
+                self.manager.cache_ready_signal.value[1] = 0
+            elif sleep_calls["count"] >= 3:
+                raise StopIteration
+
+        with (
+            patch("fastdeploy.cache_manager.cache_transfer_manager.unset_data_ipc"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.cuda_host_free"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.paddle.set_device"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.envs.FD_ENABLE_SWAP_SPACE_CLEARING", True),
+            patch("paddle.device.cuda.empty_cache"),
+            patch.object(self.manager, "_log_memory"),
+            patch("fastdeploy.cache_manager.cache_transfer_manager.time.sleep", side_effect=fake_sleep),
+        ):
+            with self.assertRaises(StopIteration):
+                self.manager.check_cache_status(args)
+
+        self.assertEqual(self.manager.kv_cache_status_signal.value[0], cache_transfer_manager.KVCacheStatus.CLEARED)
+        self.assertEqual(self.manager.cpu_cache_kvs, {})
+
     def test_check_cache_status_updating_sets_normal(self):
         class DummySignal:
             def __init__(self, value):
@@ -843,6 +1128,72 @@ class TestCacheTransferManager(unittest.TestCase):
                 self.manager.check_cache_status(args)
 
         self.assertEqual(self.manager.kv_cache_status_signal.value[0], cache_transfer_manager.KVCacheStatus.NORMAL)
+
+    def test_check_cache_status_updating_restores_with_version(self):
+        class DummySignal:
+            def __init__(self, value):
+                self.value = value
+
+        args = Args()
+        args.splitwise_role = "mixed"
+        args.mp_num = 2
+        self.manager.kv_cache_status_signal = DummySignal([cache_transfer_manager.KVCacheStatus.UPDATING])
+        self.manager.cache_ready_signal = DummySignal([0, 1])
+        self.manager.swap_space_ready_signal = DummySignal([0, 1])
+        self.manager.num_cpu_blocks = 1
+        self.manager.storage_backend_type = "mooncake"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            version_path = os.path.join(tmpdir, "version.yaml")
+            with open(version_path, "w", encoding="utf-8") as handle:
+                handle.write("version: RL-STEP99-20250101-uuid\n")
+            args.model_path = tmpdir
+
+            sleep_calls = {"count": 0}
+
+            def fake_sleep(_):
+                sleep_calls["count"] += 1
+                if sleep_calls["count"] == 1:
+                    self.manager.swap_space_ready_signal.value = [1, 1]
+                elif sleep_calls["count"] == 2:
+                    self.manager.cache_ready_signal.value = [1, 1]
+                elif sleep_calls["count"] >= 3:
+                    raise StopIteration
+
+            with (
+                patch("fastdeploy.cache_manager.cache_transfer_manager.unset_data_ipc"),
+                patch.object(self.manager, "_init_cpu_cache"),
+                patch.object(self.manager, "_init_gpu_cache"),
+                patch("fastdeploy.cache_manager.cache_transfer_manager.envs.FD_ENABLE_SWAP_SPACE_CLEARING", True),
+                patch.object(self.manager, "_log_memory"),
+                patch("fastdeploy.cache_manager.cache_transfer_manager.time.sleep", side_effect=fake_sleep),
+            ):
+                with self.assertRaises(StopIteration):
+                    self.manager.check_cache_status(args)
+
+        self.assertEqual(self.manager.kv_cache_status_signal.value[0], cache_transfer_manager.KVCacheStatus.NORMAL)
+
+    def test_log_memory_records_gpu_stats(self):
+        with patch.object(cache_transfer_manager.logger, "warning") as mock_warning:
+            with (
+                patch("paddle.device.cuda.max_memory_allocated", return_value=1024**3),
+                patch("paddle.device.cuda.max_memory_reserved", return_value=2 * 1024**3),
+                patch("paddle.device.cuda.memory_allocated", return_value=512 * 1024**2),
+                patch("paddle.device.cuda.memory_reserved", return_value=768 * 1024**2),
+            ):
+                self.manager._log_memory("test")
+
+        mock_warning.assert_called_once()
+
+    def test_main_invokes_manager(self):
+        cache_transfer_manager.args = Args()
+        with patch("fastdeploy.cache_manager.cache_transfer_manager.CacheTransferManager") as mock_manager:
+            mock_instance = mock_manager.return_value
+            mock_instance.do_data_transfer.side_effect = SystemExit
+            with self.assertRaises(SystemExit):
+                cache_transfer_manager.main()
+
+        mock_manager.assert_called_once_with(cache_transfer_manager.args)
 
 
 if __name__ == "__main__":
