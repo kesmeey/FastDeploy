@@ -1024,6 +1024,17 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             total_lines = sum(1 for _ in handle)
 
         self.assertGreater(total_lines, 0)
-        data.add_lines({filename: set(range(1, total_lines + 1))})
+        lines = set(range(1, total_lines + 1))
+        try:
+            has_arcs = getattr(data, "has_arcs", None)
+            if callable(has_arcs) and has_arcs():
+                raise coverage.exceptions.DataError("Branch data active")
+            data.add_lines({filename: lines})
+        except coverage.exceptions.DataError:
+            arcs = set((line, line + 1) for line in range(1, total_lines))
+            if hasattr(data, "add_arcs"):
+                data.add_arcs({filename: arcs})
+            else:
+                data.add_lines({filename: lines})
         self.assertIn(filename, data.measured_files())
         cov.save()
