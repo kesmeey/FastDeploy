@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 
@@ -185,6 +186,23 @@ def fake_ops(monkeypatch):
     return monkeypatch
 
 
+def test_backend_imports_kernel_module(monkeypatch):
+    kernel = DummyKernel()
+    monkeypatch.setattr(
+        backend.fastdeploy.model_executor.ops.gpu,
+        "tritonmoe_preprocess_func",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "fastdeploy.model_executor.layers.moe.triton_moe_kernels",
+        types.SimpleNamespace(fused_moe_kernel_paddle=kernel),
+    )
+    reloaded = importlib.reload(backend)
+    assert hasattr(reloaded, "fused_moe_kernel_paddle")
+
+
 def _make_block_scale(weight_tensor, block_size):
     return paddle.ones(
         [
@@ -234,6 +252,20 @@ def test_triton_weight_only_create_and_apply(fake_ops, monkeypatch):
     assert empty_out.shape == [0, layer.hidden_size]
 
 
+def test_triton_weight_only_prequant_and_bf16_create(fake_ops):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=True)
+    layer = DummyLayer(quant_config, weight_dtype="float32")
+    method = backend.TritonWeightOnlyMoEMethod(quant_config)
+    assert method.process_prequanted_weights(layer, state_dict={}) is None
+
+    method.create_weights(layer, model_format="not_torch")
+    assert list(layer.up_gate_proj_weight.shape) == [
+        layer.num_local_experts,
+        layer.hidden_size,
+        layer.moe_intermediate_size * 2,
+    ]
+
+
 def test_triton_weight_only_process_weights_after_loading_bf16(fake_ops, monkeypatch):
     quant_config = DummyQuantConfig(is_checkpoint_bf16=True)
     layer = DummyLayer(quant_config, weight_dtype="float32")
@@ -249,6 +281,37 @@ def test_triton_weight_only_process_weights_after_loading_bf16(fake_ops, monkeyp
     method.process_weights_after_loading(layer)
 
     assert transpose_calls
+
+
+def test_triton_weight_only_process_weights_after_loading_return(fake_ops):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=False)
+    layer = DummyLayer(quant_config)
+    method = backend.TritonWeightOnlyMoEMethod(quant_config)
+    assert method.process_weights_after_loading(layer) is None
+
+
+def test_triton_weight_only_apply_aux_topk(fake_ops, monkeypatch):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=False)
+    layer = DummyLayer(quant_config)
+    layer.topk_method = "aux"
+    method = backend.TritonWeightOnlyMoEMethod(quant_config)
+    method.create_weights(layer, model_format="torch")
+
+    kernel = DummyKernel()
+    monkeypatch.setattr(backend, "fused_moe_kernel_paddle", kernel, raising=False)
+
+    called = {}
+
+    def hook(topk_ids):
+        called["ids"] = topk_ids
+
+    _ = method.apply(
+        layer,
+        paddle.randn([1, layer.hidden_size], dtype="float32"),
+        DummyGate(layer.num_local_experts),
+        hook,
+    )
+    assert "ids" in called
 
 
 def test_wfp8afp8_method_apply_paths(fake_ops, monkeypatch):
@@ -285,6 +348,69 @@ def test_wfp8afp8_method_apply_paths(fake_ops, monkeypatch):
         for _ in range(layer.num_local_experts)
     ]
     method.check(layer, up_gate, down_proj)
+
+
+def test_wfp8afp8_prequant_raises(fake_ops):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=False)
+    layer = DummyLayer(quant_config)
+    method = backend.Wfp8Afp8MoEMethod(quant_config)
+    with pytest.raises(NotImplementedError):
+        method.process_prequanted_weights(layer, state_dict={})
+
+
+def test_wfp8afp8_create_weights_bf16_branch(fake_ops):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=True)
+    layer = DummyLayer(quant_config, weight_dtype="float32")
+    method = backend.Wfp8Afp8MoEMethod(quant_config)
+    method.create_weights(layer, model_format="not_torch")
+    assert list(layer.down_proj_weight.shape) == [
+        layer.num_local_experts,
+        layer.moe_intermediate_size,
+        layer.hidden_size,
+    ]
+
+
+def test_wfp8afp8_process_weights_after_loading_bf16(fake_ops, monkeypatch):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=True)
+    layer = DummyLayer(quant_config, weight_dtype="float32")
+    method = backend.Wfp8Afp8MoEMethod(quant_config)
+    method.create_weights(layer, model_format="torch")
+    method.model_format = "torch"
+
+    monkeypatch.setattr(backend, "weight_fully_copied", lambda tensor: False)
+    transpose_calls = []
+    monkeypatch.setattr(backend, "process_weight_transpose", lambda _layer, name: transpose_calls.append(name))
+    monkeypatch.setattr(backend, "free_tensor", lambda tensor: None)
+
+    def fake_per_token_cast_to_fp8(weight):
+        return weight.cast(paddle.float16), paddle.ones([weight.shape[1], 1], dtype="float32")
+
+    monkeypatch.setattr(
+        backend.fastdeploy.model_executor.layers.utils, "per_token_cast_to_fp8", fake_per_token_cast_to_fp8
+    )
+
+    method.process_weights_after_loading(layer)
+    assert transpose_calls
+
+
+def test_wfp8afp8_apply_noaux_and_empty(fake_ops, monkeypatch):
+    quant_config = DummyQuantConfig(is_checkpoint_bf16=False)
+    layer = DummyLayer(quant_config)
+    method = backend.Wfp8Afp8MoEMethod(quant_config)
+    method.create_weights(layer, model_format="torch")
+
+    kernel = DummyKernel()
+    monkeypatch.setitem(
+        sys.modules,
+        "fastdeploy.model_executor.layers.moe.triton_moe_kernels",
+        types.SimpleNamespace(fused_moe_kernel_paddle=kernel),
+    )
+
+    _ = method.apply(layer, paddle.randn([1, layer.hidden_size], dtype="float32"), DummyGate(layer.num_local_experts))
+    empty_out = method.apply(
+        layer, paddle.zeros([0, layer.hidden_size], dtype="float32"), DummyGate(layer.num_local_experts)
+    )
+    assert empty_out.shape == [0, layer.hidden_size]
 
 
 def test_tensorwise_prequant_and_apply(fake_ops, monkeypatch):
