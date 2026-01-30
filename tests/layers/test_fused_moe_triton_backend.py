@@ -36,6 +36,7 @@ class DummyQuantConfig:
         self.is_checkpoint_bf16 = is_checkpoint_bf16
         self.weight_block_size = weight_block_size
         self._name_value = name_value
+        self.deepgemm_scale_ue8m0 = False
 
     def name(self):
         return self._name_value
