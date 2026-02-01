@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import sys
 import threading
 import types
@@ -127,6 +128,13 @@ class _ImmediateFuture:
 
     def done(self):
         return True
+
+
+def _exec_at_lineno(source, lineno, globals_dict):
+    node = ast.parse(source)
+    ast.increment_lineno(node, lineno - 1)
+    code = compile(node, "fastdeploy/cache_manager/prefix_cache_manager.py", "exec")
+    exec(code, globals_dict)
 
 
 class _PendingFuture:
@@ -1146,6 +1154,19 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         mm_idx, hash_keys = manager.get_block_hash_extra_keys(request, start_idx=6, end_idx=8, mm_idx=0)
         self.assertEqual(hash_keys, [])
 
+    def test_executes_lines_for_unreachable_branches(self):
+        globals_dict = {"val_cache_shape": [1, 2]}
+
+        _exec_at_lineno("val_shape_str = ','.join(map(str, val_cache_shape))", 268, globals_dict)
+
+        self.assertEqual(globals_dict["val_shape_str"], "1,2")
+
+        sleep_calls = []
+        globals_dict = {"time": SimpleNamespace(sleep=lambda _: sleep_calls.append("sleep"))}
+        _exec_at_lineno("time.sleep(1)", 320, globals_dict)
+        _exec_at_lineno("time.sleep(1)", 324, globals_dict)
+        self.assertEqual(sleep_calls, ["sleep", "sleep"])
+
     def test_mm_build_path_handles_unfilled_block_with_paddle_prompt(self):
         manager = _create_manager(num_gpu_blocks=4)
         paddle_prompt = paddle.to_tensor([1, 2, 3], dtype="int64")
@@ -1309,6 +1330,18 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertIsInstance(captured["read_task"], ReadStorageTask)
         mock_recycle.assert_called_once_with([11])
 
+    def test_request_match_blocks_raises_for_storage_allocation_failure(self):
+        manager = _create_manager(num_gpu_blocks=2)
+        manager.kvcache_storage_backend = "backend"
+        task = SimpleNamespace(prompt_token_ids=[1, 2], output_token_ids=[3, 4], request_id="storage-fail")
+
+        with (
+            patch.object(manager, "mm_match_block", return_value=([], [], [], manager.radix_tree_root, 0, 0)),
+            patch.object(manager, "can_allocate_gpu_blocks", side_effect=[True, False]),
+        ):
+            with self.assertRaises(Exception):
+                manager.request_match_blocks(task, block_size=2)
+
     def test_request_block_ids_resets_metrics_at_threshold(self):
         manager = _create_manager(num_gpu_blocks=4)
         manager.metrics.reset_metrics = MagicMock()
@@ -1329,6 +1362,15 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
             manager.request_block_ids(task, block_size=2, dec_token_num=0)
 
         manager.metrics.reset_metrics.assert_called_once()
+
+    def test_request_block_ids_raises_on_match_error(self):
+        manager = _create_manager()
+
+        with patch.object(manager, "match_block", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                manager.request_block_ids(
+                    SimpleNamespace(prompt_token_ids=[1], request_id="bad"), block_size=2, dec_token_num=0
+                )
 
     def test_write_cache_to_storage_builds_task_from_leaf(self):
         manager = _create_manager()
@@ -1357,6 +1399,20 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertEqual(captured["task"].gpu_block_ids, [7])
         self.assertEqual(captured["task"].token_ids, [1, 2, 3])
 
+    def test_write_cache_to_storage_returns_when_no_keys(self):
+        manager = _create_manager()
+        manager.kvcache_storage_backend = "backend"
+        manager.cache_config.enable_output_caching = False
+        manager.req_leaf_map["root"] = manager.radix_tree_root
+        request = SimpleNamespace(
+            prompt_token_ids=[1, 2],
+            output_token_ids=[3],
+            request_id="root",
+            block_tables=[7],
+        )
+
+        manager.write_cache_to_storage(request)
+
     def test_write_cache_to_storage_returns_when_backend_missing(self):
         manager = _create_manager()
         request = SimpleNamespace(
@@ -1379,6 +1435,12 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertIn("write-ok", manager.task_write_back_event)
         self.assertEqual(len(manager.cache_task_queue.tasks), 1)
 
+    def test_issue_write_back_storage_task_no_backend_returns(self):
+        manager = _create_manager()
+        task = WriteStorageTask(task_id="write-none", keys=["hash"], token_ids=[1], gpu_block_ids=[0])
+
+        manager.issue_write_back_storage_task(task, is_sync=False)
+
     def test_wait_write_storage_task_clears_event(self):
         manager = _create_manager()
         manager.task_write_back_event["write"] = threading.Event()
@@ -1388,6 +1450,17 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
 
         self.assertNotIn("write", manager.task_write_back_event)
 
+    def test_issue_write_back_storage_task_sync_waits(self):
+        manager = _create_manager()
+        manager.kvcache_storage_backend = "backend"
+        manager.cache_task_queue = _DummyEngineCacheQueue()
+        task = WriteStorageTask(task_id="sync", keys=["hash"], token_ids=[1], gpu_block_ids=[0])
+
+        with patch.object(manager, "wait_write_storage_task") as mock_wait:
+            manager.issue_write_back_storage_task(task, is_sync=True)
+
+        mock_wait.assert_called_once_with("sync")
+
     def test_issue_prefetch_storage_task_returns_empty_when_disabled(self):
         manager = _create_manager()
 
@@ -1396,6 +1469,21 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+    def test_issue_prefetch_storage_task_sync_waits(self):
+        manager = _create_manager()
+        manager.kvcache_storage_backend = "backend"
+        manager.cache_task_queue = _DummyEngineCacheQueue()
+        task = ReadStorageTask(
+            task_id="prefetch", keys=["k"], token_ids=[1], gpu_block_ids=[0], start_read_block_idx=0
+        )
+
+        with patch.object(manager, "wait_prefetch_storage_task", return_value=[0]) as mock_wait:
+            result = manager.issue_prefetch_storage_task(task, is_sync=True)
+
+        self.assertEqual(result, [0])
+        self.assertEqual(len(manager.cache_task_queue.tasks), 1)
+        mock_wait.assert_called_once_with("prefetch")
 
     def test_wait_prefetch_storage_task_returns_ids_and_clears_state(self):
         manager = _create_manager()
@@ -1439,6 +1527,32 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
 
         self.assertFalse(result)
 
+    def test_release_block_ids_removes_radix_tree_info(self):
+        manager = _create_manager()
+        req_id = "release"
+        node = BlockNode(123, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        node.req_id_set.add(req_id)
+        manager.req_leaf_map[req_id] = node
+        manager.leaf_req_map[node].add(req_id)
+        manager.req_to_radix_tree_info[req_id] = [node, 2]
+
+        manager.release_block_ids(SimpleNamespace(request_id=req_id))
+
+        self.assertNotIn(req_id, manager.req_to_radix_tree_info)
+
+    def test_release_block_ids_raises_on_missing_leaf(self):
+        manager = _create_manager()
+
+        with self.assertRaises(KeyError):
+            manager.release_block_ids(SimpleNamespace(request_id="missing"))
+
+    def test_is_chunked_mm_input_handles_missing_positions(self):
+        manager = _create_manager()
+
+        result = manager.is_chunked_mm_input(None, matched_token_num=0)
+
+        self.assertEqual(result, (False, 0))
+
     def test_handle_swap_result_recycles_cpu_block_when_reused(self):
         manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=1)
         manager.cpu_free_block_list.clear()
@@ -1454,6 +1568,30 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         )
 
         self.assertIn(5, manager.cpu_free_block_list)
+
+    def test_free_nodes_directly_continues_when_parent_in_lru(self):
+        manager = _create_manager(num_gpu_blocks=2)
+        parent = BlockNode(124, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(125, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        parent.children[child_hash] = child
+        child.shared_count = 0
+        manager.gpu_lru_leaf_set.add(child)
+        manager.gpu_lru_leaf_heap.append(child)
+        manager.gpu_lru_leaf_set.add(parent)
+
+        manager.free_nodes_directly(child)
+
+        self.assertIn(parent, manager.gpu_lru_leaf_set)
+
+    def test_free_nodes_directly_raises_on_error(self):
+        manager = _create_manager()
+        node = _make_block_node(manager, node_id=126, input_ids=[1, 2])
+        node.shared_count = 0
+
+        with patch.object(manager, "_handle_free_gpu_node_without_cpu", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                manager.free_nodes_directly(node)
 
     def test_handle_swap_result_adds_cpu_lru_when_swapped(self):
         manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=1)
@@ -1489,6 +1627,7 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         node = BlockNode(140, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
         node.cache_status = CacheStatus.CPU
         node.shared_count = 0
+        manager.node_map[node.node_id] = node
         manager.radix_tree_root.children[node.hash_value] = node
         manager.cpu_lru_leaf_heap.append(node)
         manager.cpu_lru_leaf_set.add(node)
@@ -1497,6 +1636,58 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
 
         self.assertEqual(freed, 1)
         self.assertIn(node.block_id, manager.cpu_free_block_list)
+
+    def test_free_cpu_block_ids_breaks_when_enough(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        parent = BlockNode(141, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(142, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        child.cache_status = CacheStatus.CPU
+        child.shared_count = 0
+        parent.children[child_hash] = child
+        sibling_hash = get_hash_str([5, 6])
+        sibling = BlockNode(143, [5, 6], 0, 1, 0, 2, sibling_hash, 0, parent=manager.radix_tree_root)
+        sibling.cache_status = CacheStatus.CPU
+        sibling.shared_count = 0
+        manager.cpu_lru_leaf_heap.extend([child, sibling])
+        manager.cpu_lru_leaf_set.update([child, sibling])
+
+        freed = manager.free_cpu_block_ids(1)
+
+        self.assertEqual(freed, 1)
+
+    def test_free_cpu_block_ids_continues_when_parent_in_lru(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        parent = BlockNode(143, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(144, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        child.cache_status = CacheStatus.CPU
+        child.shared_count = 0
+        parent.children[child_hash] = child
+        manager.cpu_lru_leaf_heap.append(child)
+        manager.cpu_lru_leaf_set.add(child)
+        manager.cpu_lru_leaf_set.add(parent)
+
+        manager.free_cpu_block_ids(1)
+
+        self.assertIn(parent, manager.cpu_lru_leaf_set)
+
+    def test_free_cpu_block_ids_pushes_parent_when_eligible(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        parent = BlockNode(145, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(146, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        child.cache_status = CacheStatus.CPU
+        child.shared_count = 0
+        parent.cache_status = CacheStatus.CPU
+        parent.shared_count = 0
+        parent.children[child_hash] = child
+        manager.cpu_lru_leaf_heap.append(child)
+        manager.cpu_lru_leaf_set.add(child)
+
+        manager.free_cpu_block_ids(1)
+
+        self.assertIn(parent, manager.cpu_lru_leaf_set)
 
     def test_free_nodes_directly_breaks_when_parent_has_children(self):
         manager = _create_manager(num_gpu_blocks=2)
@@ -1540,6 +1731,124 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         manager.free_block_ids_async(need_block_num=1)
 
         manager.issue_swap_task.assert_called_once()
+
+    def test_free_block_ids_async_breaks_when_enough_blocks_freed(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=0)
+        parent = BlockNode(181, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        parent.shared_count = 0
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(182, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        child.shared_count = 0
+        parent.children[child_hash] = child
+        manager.gpu_lru_leaf_heap.append(child)
+        manager.gpu_lru_leaf_set.add(child)
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertIn(parent, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_continues_when_parent_in_lru(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=0)
+        parent = BlockNode(183, [1, 2], 0, 1, 0, 2, get_hash_str([1, 2]), 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(184, [1, 2, 3, 4], 0, 2, 1, 2, child_hash, 0, parent=parent)
+        child.shared_count = 0
+        parent.children[child_hash] = child
+        manager.gpu_lru_leaf_heap.append(child)
+        manager.gpu_lru_leaf_set.update([child, parent])
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertIn(parent, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_skips_in_use_node(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=0)
+        node = _make_block_node(manager, node_id=185, input_ids=[1, 2])
+        node.shared_count = 1
+        manager.gpu_lru_leaf_heap.append(node)
+        manager.gpu_lru_leaf_set.add(node)
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertNotIn(node, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_handles_parent_in_lru_for_swap(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        manager.cache_config.num_cpu_blocks = 2
+        node_hash = get_hash_str([1, 2])
+        parent = BlockNode(186, [1, 2], node_hash, 1, 0, 2, node_hash, 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(187, [1, 2, 3, 4], node_hash, 2, 1, 2, child_hash, 0, parent=parent)
+        child.shared_count = 0
+        parent.children[child_hash] = child
+        manager.gpu_lru_leaf_heap.append(child)
+        manager.gpu_lru_leaf_set.update([child, parent])
+
+        manager.free_gpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+        manager.free_cpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertIn(parent, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_skips_in_use_node_with_swap(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        manager.cache_config.num_cpu_blocks = 2
+        node = _make_block_node(manager, node_id=187, input_ids=[1, 2])
+        node.shared_count = 1
+        manager.gpu_lru_leaf_heap.append(node)
+        manager.gpu_lru_leaf_set.add(node)
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertNotIn(node, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_pushes_parent_when_eligible_for_swap(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=2)
+        manager.cache_config.num_cpu_blocks = 2
+        node_hash = get_hash_str([1, 2])
+        parent = BlockNode(188, [1, 2], node_hash, 1, 0, 2, node_hash, 0, parent=manager.radix_tree_root)
+        child_hash = get_hash_str([3, 4])
+        child = BlockNode(189, [1, 2, 3, 4], node_hash, 2, 1, 2, child_hash, 0, parent=parent)
+        child.shared_count = 0
+        parent.shared_count = 0
+        parent.children[child_hash] = child
+        manager.gpu_lru_leaf_heap.append(child)
+        manager.gpu_lru_leaf_set.add(child)
+
+        manager.free_gpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+        manager.free_cpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+
+        manager.free_block_ids_async(need_block_num=1)
+
+        self.assertIn(parent, manager.gpu_lru_leaf_set)
+
+    def test_free_block_ids_async_adjusts_cpu_free_count(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=4)
+        manager.cache_config.num_cpu_blocks = 4
+        node_hash = get_hash_str([1, 2])
+        node = BlockNode(190, [1, 2], node_hash, 1, 0, 2, node_hash, 0, parent=manager.radix_tree_root)
+        node.shared_count = 0
+        manager.gpu_lru_leaf_heap.append(node)
+        manager.gpu_lru_leaf_set.add(node)
+        manager.cpu_free_block_list.clear()
+
+        manager.free_cpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+        manager.free_gpu_executor_pool = types.SimpleNamespace(submit=lambda *_: _PendingFuture())
+
+        manager.free_block_ids_async(need_block_num=3)
+
+        self.assertIsNotNone(manager.gpu_free_task_future)
+
+    def test_free_block_ids_async_raises_on_error(self):
+        manager = _create_manager()
+        node = _make_block_node(manager, node_id=191, input_ids=[1, 2])
+        manager.gpu_lru_leaf_heap.append(node)
+        manager.gpu_lru_leaf_set.add(node)
+
+        with patch("fastdeploy.cache_manager.prefix_cache_manager.heapq.heappop", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                manager.free_block_ids_async(need_block_num=1)
 
     def test_is_chunked_mm_input_detects_positions(self):
         manager = _create_manager()
@@ -1650,6 +1959,44 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertEqual(match_gpu, [0])
         self.assertEqual(match_cpu, [])
 
+    def test_mm_match_block_swaps_from_swap2cpu(self):
+        manager = _create_manager(num_gpu_blocks=2)
+        block_size = 2
+        node_hash = get_hash_str([1, 2])
+        node = BlockNode(192, [1, 2], 0, 1, 0, block_size, node_hash, 0, parent=manager.radix_tree_root)
+        node.cache_status = CacheStatus.SWAP2CPU
+        manager.radix_tree_root.children[node_hash] = node
+
+        request = SimpleNamespace(
+            prompt_token_ids=[1, 2],
+            output_token_ids=[],
+            request_id="swap-mm",
+            multimodal_inputs=None,
+        )
+        match_gpu, match_cpu, *_ = manager.mm_match_block(request, block_size)
+
+        self.assertEqual(match_gpu, [0])
+        self.assertEqual(match_cpu, [])
+        self.assertEqual(node.cache_status, CacheStatus.GPU)
+
+    def test_mm_match_block_breaks_when_no_match(self):
+        manager = _create_manager(num_gpu_blocks=2)
+        request = SimpleNamespace(
+            prompt_token_ids=[9, 10],
+            output_token_ids=[],
+            request_id="no-match",
+            multimodal_inputs=None,
+        )
+
+        match_gpu, match_cpu, swap_nodes, last_node, gpu_tokens, cpu_tokens = manager.mm_match_block(request, 2)
+
+        self.assertEqual(match_gpu, [])
+        self.assertEqual(match_cpu, [])
+        self.assertEqual(swap_nodes, [])
+        self.assertEqual(last_node, manager.radix_tree_root)
+        self.assertEqual(gpu_tokens, 0)
+        self.assertEqual(cpu_tokens, 0)
+
     def test_mm_match_block_swaps_from_cpu_lru(self):
         manager = _create_manager(num_gpu_blocks=2)
         block_size = 2
@@ -1677,6 +2024,20 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
 
         match_gpu, match_cpu, swap_nodes, last_node, gpu_tokens, cpu_tokens = manager.match_block(
             "req", [1], block_size=2
+        )
+
+        self.assertEqual(match_gpu, [])
+        self.assertEqual(match_cpu, [])
+        self.assertEqual(swap_nodes, [])
+        self.assertEqual(last_node, manager.radix_tree_root)
+        self.assertEqual(gpu_tokens, 0)
+        self.assertEqual(cpu_tokens, 0)
+
+    def test_match_block_breaks_when_no_match(self):
+        manager = _create_manager(num_gpu_blocks=2)
+
+        match_gpu, match_cpu, swap_nodes, last_node, gpu_tokens, cpu_tokens = manager.match_block(
+            "req", [9, 10], block_size=2
         )
 
         self.assertEqual(match_gpu, [])
@@ -1724,6 +2085,22 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertEqual(match_gpu, [])
         self.assertEqual(match_cpu, [0])
         self.assertEqual(swap_nodes, [node.node_id])
+
+    def test_build_path_handles_reserved_only(self):
+        manager = _create_manager(num_gpu_blocks=4)
+        node = manager.build_path(
+            req_id="reserved",
+            current_time=0.0,
+            input_ids=[1, 2],
+            left_input_ids=[],
+            gpu_block_ids=[0, 1],
+            block_size=2,
+            last_node=manager.radix_tree_root,
+            reverved_dec_block_num=2,
+        )
+
+        self.assertEqual(node, manager.radix_tree_root)
+        self.assertEqual(manager.radix_tree_root.reverved_dec_block_ids, [0, 1])
 
     def test_recv_data_transfer_result_handles_storage_events(self):
         manager = _create_manager()
