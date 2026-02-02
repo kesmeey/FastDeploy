@@ -1189,6 +1189,31 @@ class TestPrefixCacheManagerCoverage(unittest.TestCase):
         self.assertIsNot(leaf, manager.radix_tree_root)
         self.assertEqual(leaf.reverved_dec_block_ids, [1])
 
+    def test_mm_build_path_handles_multimodal_partial_block(self):
+        manager = _create_manager(num_gpu_blocks=4)
+        request = SimpleNamespace(
+            prompt_token_ids=np.array([1, 2, 3]),
+            output_token_ids=[],
+            block_tables=[0, 1],
+            request_id="mm-partial",
+            multimodal_inputs={
+                "mm_positions": [SimpleNamespace(offset=1, length=1)],
+                "mm_hashes": ["img"],
+            },
+            num_total_tokens=3,
+        )
+
+        leaf = manager.mm_build_path(
+            request=request,
+            num_computed_tokens=4,
+            block_size=2,
+            last_node=manager.radix_tree_root,
+            num_cached_tokens=0,
+        )
+
+        self.assertIsNot(leaf, manager.radix_tree_root)
+        self.assertEqual(leaf.reverved_dec_block_ids, [1])
+
     def test_launch_cache_manager_handles_storage_and_threads(self):
         manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=1)
         manager.cache_config.kvcache_storage_backend = "backend"
