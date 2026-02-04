@@ -1096,6 +1096,28 @@ class PrefixCacheManagerTest(unittest.TestCase):
         )
         self.assertNotEqual(leaf, manager.radix_tree_root)
 
+    def test_mm_build_path_full_blocks_no_unfilled(self):
+        manager = _create_manager(num_gpu_blocks=4)
+        request = SimpleNamespace(
+            prompt_token_ids=[1, 2, 3, 4],
+            output_token_ids=[],
+            block_tables=[0, 1],
+            request_id="mm-full",
+            multimodal_inputs={"mm_positions": [], "mm_hashes": []},
+        )
+
+        leaf = manager.mm_build_path(
+            request=request,
+            num_computed_tokens=4,
+            block_size=2,
+            last_node=manager.radix_tree_root,
+            num_cached_tokens=0,
+        )
+
+        self.assertIsNot(leaf, manager.radix_tree_root)
+        self.assertEqual(leaf.reverved_dec_block_ids, [])
+        self.assertEqual(manager.unfilled_req_block_map, {})
+
     def test_handle_swap_result_updates_status(self):
         manager = _create_manager(num_gpu_blocks=4, num_cpu_blocks=2)
         node = BlockNode(90, [1], 0, 1, 0, 1, get_hash_str([1]), 0, parent=manager.radix_tree_root)
@@ -1117,6 +1139,18 @@ class PrefixCacheManagerTest(unittest.TestCase):
         manager.gpu_free_task_future = _ImmediateFuture(lambda: None)
         manager.reset()
         self.assertEqual(len(manager.node_map), 0)
+
+    def test_reset_without_gpu_free_future(self):
+        manager = _create_manager(num_gpu_blocks=2, num_cpu_blocks=1)
+        node = BlockNode(101, [1], 0, 1, 0, 1, get_hash_str([1]), 0, parent=manager.radix_tree_root)
+        manager.node_map[node.node_id] = node
+        manager.task_swapping_event["evt"] = threading.Event()
+        manager.task_swapping_event["evt"].set()
+
+        manager.reset()
+
+        self.assertIsNone(manager.gpu_free_task_future)
+        self.assertEqual(manager.task_swapping_event, {})
 
     def test_recv_data_transfer_result_processes_queue(self):
         manager = _create_manager(num_gpu_blocks=4, num_cpu_blocks=1)
@@ -1143,6 +1177,18 @@ class PrefixCacheManagerTest(unittest.TestCase):
         with patch("fastdeploy.cache_manager.prefix_cache_manager.time.sleep", side_effect=SystemExit):
             with self.assertRaises(SystemExit):
                 manager.clear_prefix_cache()
+
+    def test_clear_prefix_cache_noop_for_normal_status(self):
+        manager = _create_manager()
+        manager.prefix_tree_status_signal = SimpleNamespace(
+            value=np.array([PrefixTreeStatus.NORMAL], dtype=np.int32)
+        )
+        manager.reset = MagicMock()
+        with patch("fastdeploy.cache_manager.prefix_cache_manager.time.sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                manager.clear_prefix_cache()
+        manager.reset.assert_not_called()
+        self.assertEqual(manager.prefix_tree_status_signal.value[0], PrefixTreeStatus.NORMAL)
 
 
 # Coverage-oriented tests. These are used to lightly exercise specific
