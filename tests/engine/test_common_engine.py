@@ -281,7 +281,17 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
     """
 
     def setUp(self):
-        patch("fastdeploy.engine.common_engine.EngineCacheQueue").start()
+        cache_queue_patcher = patch("fastdeploy.engine.common_engine.EngineCacheQueue")
+        cache_queue_patcher.start()
+        self.addCleanup(cache_queue_patcher.stop)
+
+    @staticmethod
+    def _detach_finalizer(engine):
+        if hasattr(engine, "_finalizer"):
+            try:
+                engine._finalizer.detach()
+            except Exception:
+                pass
 
     def _make_cfg(self, **kwargs):
         # If DP > 1, we must provide enough engine_worker_queue_port for each dp index
@@ -416,11 +426,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         # cache manager started before workers (lines 184-185)
         self.assertTrue(started_cache.get("called", False))
         # avoid atexit finalizer
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_start_mixed_branch_cache_after_load_and_zmq(self):
         """Cover lines 215-217 and 231 in start()."""
@@ -492,11 +498,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         self.assertTrue(started_cache.get("called", False))  # lines 215-217
         self.assertEqual(zmq_called.get("pid"), 8888)  # line 231
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_insert_zmq_task_error_logging(self):
         """Cover lines 934-935 and 937 in _insert_zmq_task_to_scheduler."""
@@ -554,11 +556,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             # verify error logger
             mock_logger.error.assert_called()
 
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_exit_sub_services_cleanup_paths(self):
         """Cover lines 1312-1340, 1350-1354 in _exit_sub_services."""
@@ -647,11 +645,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.cache_task_queue = DummyMgr()
         eng._exit_sub_services()
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_start_worker_service_cmd_build(self):
         """Cover 1517, 1526, 1568, 1592, 1595 by building the worker command with mocks."""
@@ -695,11 +689,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         self.assertIn("--num_gpu_blocks_override 4", captured["cmd"])  # type: ignore
         # ips/nnodes added when nnode > 1 (1595)
         self.assertIn("--nnodes 2", captured["cmd"])  # type: ignore
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_check_health_unhealthy(self):
         """Cover line 1628: unhealthy worker."""
@@ -721,11 +711,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         ok, msg = eng.check_health(time_interval_threashold=1)
         self.assertFalse(ok)
         self.assertIn("Not Healthy".lower(), msg.lower())
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_launch_components_expert_parallel(self):
         """Cover 1635-1638, 1660-1676, 1684-1703 in launch_components()."""
@@ -783,11 +769,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 # Verify expert service branch executed
                 self.assertTrue(hasattr(eng, "dp_processed"))
                 self.assertGreaterEqual(len(eng.dp_processed), 1)
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_check_worker_initialize_status_progress(self):
         """Cover 1710-1762 by simulating stdout and ready signals."""
@@ -852,11 +834,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
                 ok = eng.check_worker_initialize_status()
         self.assertTrue(ok)
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_worker_processes_ready_false(self):
         """Cover line 1382 returning False."""
@@ -876,11 +854,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.worker_ready_signal = Sig()
         self.assertFalse(eng._worker_processes_ready())
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_init_worker_signals_profile_iluvatar(self):
         """Cover line 1434 by forcing iluvatar custom device and do_profile=True."""
@@ -898,11 +872,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             eng._init_worker_signals()
         # signal should exist
         self.assertTrue(hasattr(eng, "get_profile_block_num_signal"))
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_launch_components_dp_mode(self):
         """Cover 1648-1652 branch for DP scheduler mode."""
@@ -927,11 +897,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.scheduler.start = Mock()
         eng.launch_components()
         eng.scheduler.start.assert_called()
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_clear_data_success_and_failure(self):
         """Cover clear_data success and exception paths."""
@@ -962,11 +928,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         self.assertFalse(eng.clear_data())
         self.assertEqual(eng.send_response_server.req_dict, {"req": "a"})
         self.assertEqual(eng.recv_request_server.req_dict, {"req": "b"})
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
 
     def test_insert_tasks_raises_when_no_resources(self):
         """Cover insert_tasks resource exhaustion error branch."""
@@ -990,8 +952,4 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         with self.assertRaises(EngineError) as ctx:
             eng.insert_tasks([request])
         self.assertIn("request id", str(ctx.exception))
-        if hasattr(eng, "_finalizer"):
-            try:
-                eng._finalizer.detach()
-            except Exception:
-                pass
+        self._detach_finalizer(eng)
