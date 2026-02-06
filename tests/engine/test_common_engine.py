@@ -145,6 +145,12 @@ class TestCommonEngine(unittest.TestCase):
         """Clean up after all tests"""
         if hasattr(cls, "engine") and cls.engine is not None:
             try:
+                if hasattr(cls.engine, "resource_manager") and hasattr(cls.engine.resource_manager, "cache_manager"):
+                    cache_manager = cls.engine.resource_manager.cache_manager
+                    if not hasattr(cache_manager, "shm_cache_task_flag_broadcast"):
+                        cache_manager.shm_cache_task_flag_broadcast = Mock(clear=Mock())
+                    if not hasattr(cache_manager, "cache_ready_signal"):
+                        cache_manager.cache_ready_signal = Mock(clear=Mock())
                 if hasattr(cls.engine, "_finalizer"):
                     cls.engine._finalizer.detach()
                 cls.engine.worker_proc = None
@@ -740,6 +746,40 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             eng.start_worker_queue_service(start_queue=True)
 
         self.assertEqual(eng.cfg.parallel_config.local_engine_worker_queue_port, 12345)
+        self._detach_finalizer(eng)
+
+    def test_register_to_router_disabled(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.cfg.router_config.router = None
+
+        with (
+            patch.object(eng, "llm_logger") as mock_logger,
+            patch("fastdeploy.engine.common_engine.threading.Thread") as thread_mock,
+        ):
+            eng._register_to_router()
+
+        mock_logger.info.assert_called()
+        thread_mock.assert_not_called()
+        self._detach_finalizer(eng)
+
+    def test_start_cache_service_passes_args(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.resource_manager.cache_manager = Mock(launch_cache_manager=Mock(return_value=["proc"]))
+
+        result = eng.start_cache_service(device_ids=[0], ipc_signal_suffix="suffix")
+
+        eng.resource_manager.cache_manager.launch_cache_manager.assert_called_once_with(
+            cache_config=cfg.cache_config,
+            tensor_parallel_size=cfg.parallel_config.tensor_parallel_size,
+            device_ids=[0],
+            pod_ip=cfg.master_ip,
+            engine_worker_queue_port=cfg.parallel_config.local_engine_worker_queue_port,
+            ipc_suffix="suffix",
+            create_cache_tensor=False,
+        )
+        self.assertEqual(result, ["proc"])
         self._detach_finalizer(eng)
 
     def test_init_worker_signals_with_profile(self):
