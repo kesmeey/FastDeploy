@@ -151,6 +151,8 @@ class TestCommonEngine(unittest.TestCase):
                         cache_manager.shm_cache_task_flag_broadcast = Mock(clear=Mock())
                     if not hasattr(cache_manager, "cache_ready_signal"):
                         cache_manager.cache_ready_signal = Mock(clear=Mock())
+                if getattr(cls.engine, "cache_manager_processes", None) is None:
+                    cls.engine.cache_manager_processes = []
                 if hasattr(cls.engine, "_finalizer"):
                     cls.engine._finalizer.detach()
                 cls.engine.worker_proc = None
