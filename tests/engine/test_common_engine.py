@@ -17,7 +17,7 @@
 import os
 import time
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import numpy as np
 import paddle
@@ -33,7 +33,7 @@ if not hasattr(paddle, "compat"):
 
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.common_engine import EngineService
-from fastdeploy.engine.request import Request
+from fastdeploy.engine.request import ControlRequest, Request
 from fastdeploy.utils import EngineError
 
 MODEL_NAME = os.getenv("MODEL_PATH", "/path/to/models") + "/ERNIE-4.5-0.3B-Paddle"
@@ -994,6 +994,127 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         self.assertFalse(eng.clear_data())
         self.assertEqual(eng.send_response_server.req_dict, {"req": "a"})
         self.assertEqual(eng.recv_request_server.req_dict, {"req": "b"})
+        if hasattr(eng, "_finalizer"):
+            try:
+                eng._finalizer.detach()
+            except Exception:
+                pass
+
+    def test_decode_token_return_text_updates_status(self):
+        """Cover _decode_token return-text branch and decode_status cleanup."""
+        cfg = self._make_cfg(splitwise_role="mixed")
+
+        class DummyQ:
+            def __init__(self, *a, **k):
+                pass
+
+        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
+            eng = EngineService(cfg, start_queue=False, use_async_llm=False)
+
+        class DummyProcessor:
+            def __init__(self):
+                self.decode_status = {"req1": [1, 3]}
+
+            def ids2tokens(self, token_ids, req_id):
+                return "hi", token_ids, None
+
+        eng.data_processor = DummyProcessor()
+        token_ids = paddle.to_tensor([10, 11, 12, 13], dtype="int64").numpy().tolist()
+
+        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_RETURN_TEXT", True):
+            delta_text, trimmed = eng._decode_token(token_ids, "req1", is_end=True)
+
+        self.assertEqual(delta_text, "hi")
+        self.assertEqual(trimmed, [11, 12])
+        self.assertNotIn("req1", eng.data_processor.decode_status)
+        if hasattr(eng, "_finalizer"):
+            try:
+                eng._finalizer.detach()
+            except Exception:
+                pass
+
+    def test_decode_token_no_delta_keeps_tokens_empty(self):
+        """Cover _decode_token when no delta text is produced."""
+        cfg = self._make_cfg(splitwise_role="mixed")
+
+        class DummyQ:
+            def __init__(self, *a, **k):
+                pass
+
+        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
+            eng = EngineService(cfg, start_queue=False, use_async_llm=False)
+
+        class DummyProcessor:
+            def __init__(self):
+                self.decode_status = {"req2": [0, 0]}
+
+            def ids2tokens(self, token_ids, req_id):
+                return "", token_ids, None
+
+        eng.data_processor = DummyProcessor()
+        token_ids = paddle.to_tensor([99], dtype="int64").numpy().tolist()
+
+        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_RETURN_TEXT", True):
+            delta_text, trimmed = eng._decode_token(token_ids, "req2", is_end=False)
+
+        self.assertEqual(delta_text, "")
+        self.assertEqual(trimmed, [])
+        self.assertIn("req2", eng.data_processor.decode_status)
+        if hasattr(eng, "_finalizer"):
+            try:
+                eng._finalizer.detach()
+            except Exception:
+                pass
+
+    def test_send_error_response_internal_adapter_branches(self):
+        """Cover _send_error_response branches for internal adapter and default paths."""
+        cfg = self._make_cfg(splitwise_role="mixed")
+
+        class DummyQ:
+            def __init__(self, *a, **k):
+                pass
+
+        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
+            eng = EngineService(cfg, start_queue=False, use_async_llm=False)
+
+        eng.send_response_server = Mock()
+        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False):
+            eng._send_error_response("req3", "boom", error_code=400)
+            eng.send_response_server.send_response.assert_called_with("req3", ANY)
+
+        eng.send_response_server.reset_mock()
+        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", True):
+            eng._send_error_response("req4", "boom2", error_code=401)
+            eng.send_response_server.send_response.assert_called_with(None, ANY)
+
+        if hasattr(eng, "_finalizer"):
+            try:
+                eng._finalizer.detach()
+            except Exception:
+                pass
+
+    def test_call_worker_dispatches_and_waits(self):
+        """Cover _call_worker path to enqueue and await responses."""
+        cfg = self._make_cfg(splitwise_role="mixed")
+
+        class DummyQ:
+            def __init__(self, *a, **k):
+                pass
+
+        with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ):
+            eng = EngineService(cfg, start_queue=False, use_async_llm=False)
+
+        eng.engine_worker_queue = Mock()
+
+        async def fake_wait_all(request_id, timeout):
+            return {"request_id": request_id, "timeout": timeout}
+
+        eng._wait_all_control_responses = fake_wait_all
+        request = ControlRequest(request_id="ctrl1", method="reset_scheduler", args={"x": 1})
+        result = eng._call_worker(request, timeout=3)
+
+        eng.engine_worker_queue.put_tasks.assert_called_with(([request], 1))
+        self.assertEqual(result, {"request_id": "ctrl1", "timeout": 3})
         if hasattr(eng, "_finalizer"):
             try:
                 eng._finalizer.detach()
