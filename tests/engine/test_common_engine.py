@@ -957,6 +957,307 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             eng._control_update_weights(ControlRequest(request_id="ctrl", method="update_weights"))
         self._detach_finalizer(eng)
 
+    def test_register_to_router_disabled(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.cfg.router_config.router = None
+
+        with (
+            patch.object(eng, "llm_logger") as mock_logger,
+            patch("fastdeploy.engine.common_engine.threading.Thread") as thread_mock,
+        ):
+            eng._register_to_router()
+
+        mock_logger.info.assert_called()
+        thread_mock.assert_not_called()
+        self._detach_finalizer(eng)
+
+    def test_insert_zmq_task_to_scheduler_normal_request(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.is_paused = False
+        eng.guided_decoding_checker = None
+        eng.resource_manager = Mock(abort_req_ids_set=set(), requests={})
+        eng.scheduler = Mock()
+        eng.engine_worker_queue = Mock()
+
+        class DummyMetrics:
+            def __init__(self):
+                self.requests_number = Mock(inc=Mock())
+                self.num_requests_waiting = Mock(inc=Mock())
+
+        class DummyRecv:
+            def __init__(self):
+                self.calls = 0
+
+            def receive_json_once(self, block):
+                self.calls += 1
+                if self.calls == 1:
+                    return None, {"request_id": "ctrl", "method": "is_paused", "args": {}}
+                if self.calls == 2:
+                    return None, {
+                        "request_id": "req1",
+                        "prompt_token_ids": [1, 2],
+                        "prompt_token_ids_len": 2,
+                        "temperature": 1.0,
+                    }
+                eng.running = False
+                return None, None
+
+        eng.recv_request_server = DummyRecv()
+        eng.run_control_method = Mock()
+        eng.scheduler.put_requests.return_value = [("req1", None)]
+
+        with (
+            patch("fastdeploy.engine.common_engine.main_process_metrics", DummyMetrics()),
+            patch("fastdeploy.engine.common_engine.envs.ENABLE_V1_DATA_PROCESSOR", False),
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._insert_zmq_task_to_scheduler()
+
+        eng.run_control_method.assert_called_once()
+        eng.scheduler.put_requests.assert_called()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_single_batch(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = [1, 2]
+                self.decode_type = 1
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=True,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return {"rid": [output]}
+
+        eng.scheduler.get_results = get_results
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False),
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        eng.send_response_server.send_response.assert_called()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_internal_adapter_decode(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyProcessor:
+            def __init__(self):
+                self.decode_status = {"rid": (0, 2)}
+
+            def ids2tokens(self, token_ids, req_id):
+                return "hi", [1, 2], None
+
+        eng.data_processor = DummyProcessor()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = [1, 2]
+                self.decode_type = 0
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=True,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return [[output]]
+
+        eng.scheduler.get_results = get_results
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", True),
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        eng.send_response_server.send_response.assert_called_once()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_internal_adapter_decode_type_one(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = [3, 4]
+                self.decode_type = 1
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=True,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return [[output]]
+
+        eng.scheduler.get_results = get_results
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", True),
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        eng.send_response_server.send_response.assert_called_once()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_internal_adapter_warns_on_empty(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = []
+                self.decode_type = 1
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=False,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return [[output]]
+
+        eng.scheduler.get_results = get_results
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", True),
+            patch.object(eng, "llm_logger") as mock_logger,
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        mock_logger.warning.assert_called()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_empty_results(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return []
+
+        eng.scheduler.get_results = get_results
+
+        with patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None):
+            eng._zmq_send_generated_tokens()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_decode_type_zero(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = [1, 2]
+                self.decode_type = 0
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=True,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return {"rid": [output]}
+
+        eng.scheduler.get_results = get_results
+        eng._decode_token = Mock(return_value=("hi", [1, 2]))
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False),
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        eng.send_response_server.send_response.assert_called_once()
+        self._detach_finalizer(eng)
+
+    def test_zmq_send_generated_tokens_warns_on_empty(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.running = True
+        eng.send_response_server = Mock()
+
+        class DummyOutput:
+            def __init__(self):
+                self.token_ids = []
+                self.decode_type = 1
+                self.tool_calls = None
+
+        output = RequestOutput(
+            request_id="rid",
+            outputs=DummyOutput(),
+            finished=False,
+            metrics=Mock(),
+        )
+        eng.scheduler = Mock()
+
+        def get_results():
+            eng.running = False
+            return {"rid": [output]}
+
+        eng.scheduler.get_results = get_results
+
+        with (
+            patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False),
+            patch.object(eng, "llm_logger") as mock_logger,
+            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+        ):
+            eng._zmq_send_generated_tokens()
+
+        mock_logger.warning.assert_called()
+        self._detach_finalizer(eng)
+
     def test_wait_all_control_responses_success(self):
         cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
         eng = self._make_engine(cfg)
