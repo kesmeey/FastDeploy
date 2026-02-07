@@ -36,7 +36,7 @@ if not hasattr(paddle, "compat"):
 
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.common_engine import EngineService
-from fastdeploy.engine.request import ControlRequest, Request, RequestOutput
+from fastdeploy.engine.request import ControlRequest, ControlResponse, Request, RequestOutput
 from fastdeploy.utils import EngineError
 
 MODEL_NAME = os.getenv("MODEL_PATH", "/path/to/models") + "/ERNIE-4.5-0.3B-Paddle"
@@ -744,6 +744,35 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         self.assertEqual(eng.cfg.parallel_config.local_engine_worker_queue_port, 12345)
         self._detach_finalizer(eng)
 
+    def test_init_worker_monitor_signals_creates_ipc(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+
+        class DummyQ:
+            def __init__(self, *a, **k):
+                pass
+
+        created = []
+
+        class DummySignal:
+            def __init__(self, name, array, dtype, suffix, create):
+                self.name = name
+                self.array = array
+                self.dtype = dtype
+                self.suffix = suffix
+                self.create = create
+                created.append(name)
+
+        with (
+            patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQ),
+            patch("fastdeploy.engine.common_engine.IPCSignal", DummySignal),
+        ):
+            eng = EngineService(cfg, start_queue=False, use_async_llm=True)
+
+        self.assertIn("exist_task_signal", created)
+        self.assertIn("worker_healthy_live_signal", created)
+        self.assertTrue(hasattr(eng, "kv_cache_status_signal"))
+        self._detach_finalizer(eng)
+
     def test_init_worker_signals_with_profile(self):
         cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
         eng = self._make_engine(cfg)
@@ -792,6 +821,35 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         self.assertEqual(eng.do_profile, 0)
         eng.resource_manager.reset_cache_config.assert_called_once()
         self.assertIsNotNone(eng.cache_manager_processes)
+        self._detach_finalizer(eng)
+
+    def test_start_worker_queue_service_with_shm_address(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+
+        class DummyQueue:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+
+            def get_server_port(self):
+                return 22222
+
+            def cleanup(self):
+                pass
+
+        class DummyCacheQueue(DummyQueue):
+            pass
+
+        eng = self._make_engine(cfg)
+        with (
+            patch("fastdeploy.engine.common_engine.EngineWorkerQueue", DummyQueue),
+            patch("fastdeploy.engine.common_engine.EngineCacheQueue", DummyCacheQueue),
+            patch("fastdeploy.engine.common_engine.envs.FD_ENGINE_TASK_QUEUE_WITH_SHM", True),
+        ):
+            eng.start_worker_queue_service(start_queue=True)
+
+        address = eng.engine_worker_queue.kwargs["address"]
+        self.assertTrue(isinstance(address, str))
+        self.assertIn("/dev/shm/fd_task_queue_", address)
         self._detach_finalizer(eng)
 
     def test_start_worker_service_builds_command(self):
@@ -945,6 +1003,24 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             eng.run_control_method(ControlRequest(request_id="pause", method="pause"))
 
         eng.send_response_server.send_response.assert_called()
+        self._detach_finalizer(eng)
+
+    def test_call_worker_puts_tasks_and_returns(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        eng.engine_worker_queue = Mock()
+
+        class DummyQueue:
+            def __init__(self):
+                self.name = "q0"
+
+            async def get(self, timeout=None):
+                return Mock(payload=ControlResponse(request_id="req", result={"ok": True}, error_code=200))
+
+        eng._ctrl_worker_output_queues = [DummyQueue()]
+        result = eng._call_worker(ControlRequest(request_id="req", method="noop"), timeout=1)
+        self.assertEqual(result, [{"ok": True}])
+        eng.engine_worker_queue.put_tasks.assert_called_once()
         self._detach_finalizer(eng)
 
     def test_control_update_weights_requires_pause(self):
@@ -1297,6 +1373,43 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         with self.assertRaises(Exception):
             asyncio.run(eng._wait_all_control_responses("req", timeout=1))
+        self._detach_finalizer(eng)
+
+    def test_wait_all_control_responses_error_code(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+
+        class DummyQueue:
+            def __init__(self, name, payload):
+                self.name = name
+                self._payload = payload
+
+            async def get(self, timeout=None):
+                return Mock(payload=self._payload)
+
+        eng._ctrl_worker_output_queues = [
+            DummyQueue("q0", ControlResponse(request_id="req", error_code=500, error_message="bad")),
+        ]
+
+        with self.assertRaises(Exception):
+            asyncio.run(eng._wait_all_control_responses("req", timeout=1))
+        self._detach_finalizer(eng)
+
+    def test_wait_all_control_responses_timeout(self):
+        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
+        eng = self._make_engine(cfg)
+        class DummyQueue:
+            def __init__(self):
+                self.name = "q0"
+
+            async def get(self, timeout=None):
+                return None
+
+        eng._ctrl_worker_output_queues = [DummyQueue()]
+
+        with patch("fastdeploy.engine.common_engine.asyncio.wait_for", side_effect=asyncio.TimeoutError):
+            with self.assertRaises(Exception):
+                asyncio.run(eng._wait_all_control_responses("req", timeout=1))
         self._detach_finalizer(eng)
 
     def test_insert_tasks_prefill_error_and_success(self):
