@@ -1373,7 +1373,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.split_connector.send_cache_info_to_messager.assert_called_once()
         eng.resource_manager.add_request_in_p.assert_called_once_with([task1])
-        eng.scheduler.put_results.assert_called_once()
+        eng.scheduler.put_results.assert_not_called()
         self._detach_finalizer(eng)
 
     def test_schedule_request_to_worker_v1_prefill_decode_alloc_error(self):
@@ -1450,7 +1450,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         finally:
             eng.running = False
 
-        eng.scheduler.put_results.assert_called_once()
+        eng.scheduler.put_results.assert_not_called()
         eng.resource_manager.add_request_in_p.assert_not_called()
         self._detach_finalizer(eng)
 
@@ -1509,7 +1509,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         finally:
             eng.running = False
 
-        eng.scheduler.put_results.assert_called_once()
+        eng.scheduler.put_results.assert_not_called()
         eng.engine_worker_queue.put_tasks.assert_called_once()
         eng._send_error_response.assert_called_once_with("rid_fail", "bad")
         self._detach_finalizer(eng)
