@@ -1495,13 +1495,19 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 pass
 
             def submit(self, fn):
-                fn()
+                try:
+                    fn()
+                finally:
+                    eng.running = False
 
-        with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._schedule_request_to_worker_v1()
+        try:
+            with (
+                patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
+                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+            ):
+                eng._schedule_request_to_worker_v1()
+        finally:
+            eng.running = False
 
         eng.scheduler.put_results.assert_called_once()
         eng.engine_worker_queue.put_tasks.assert_called_once()
