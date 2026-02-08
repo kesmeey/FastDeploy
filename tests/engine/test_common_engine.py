@@ -1217,6 +1217,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.running = True
         eng.is_paused = False
         eng._pause_cond = threading.Condition()
+        self.addCleanup(lambda: setattr(eng, "running", False))
 
         class DummyRM:
             def __init__(self):
@@ -1239,13 +1240,19 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 pass
 
             def submit(self, fn):
-                fn()
+                try:
+                    fn()
+                finally:
+                    eng.running = False
 
-        with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._schedule_request_to_worker_v1()
+        try:
+            with (
+                patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
+                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+            ):
+                eng._schedule_request_to_worker_v1()
+        finally:
+            eng.running = False
 
         self._detach_finalizer(eng)
 
@@ -1487,7 +1494,10 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 self.daemon = daemon
 
             def start(self):
-                self.target()
+                try:
+                    self.target()
+                finally:
+                    eng.running = False
 
         with (
             patch("fastdeploy.engine.common_engine.threading.Thread", DummyThread),
@@ -1508,6 +1518,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         )
         eng = self._make_engine(cfg)
         eng.running = True
+        self.addCleanup(lambda: setattr(eng, "running", False))
         eng.cfg.splitwise_version = "v1"
         eng.enable_decode_cache_task = True
         eng.scheduler = Mock(has_request=Mock(return_value=True), put_results=Mock())
@@ -1561,14 +1572,20 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 self.daemon = daemon
 
             def start(self):
-                self.target()
+                try:
+                    self.target()
+                finally:
+                    eng.running = False
 
-        with (
-            patch("fastdeploy.engine.common_engine.envs.ENABLE_V1_KVCACHE_SCHEDULER", True),
-            patch("fastdeploy.engine.common_engine.threading.Thread", DummyThread),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._decode_process_splitwise_requests()
+        try:
+            with (
+                patch("fastdeploy.engine.common_engine.envs.ENABLE_V1_KVCACHE_SCHEDULER", True),
+                patch("fastdeploy.engine.common_engine.threading.Thread", DummyThread),
+                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
+            ):
+                eng._decode_process_splitwise_requests()
+        finally:
+            eng.running = False
 
         eng.split_connector.send_cache_info_to_prefill.assert_called_once()
         eng.scheduler.put_results.assert_called()
