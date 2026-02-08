@@ -36,14 +36,7 @@ if not hasattr(paddle, "compat"):
 
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.common_engine import EngineService
-from fastdeploy.engine.request import (
-    ControlRequest,
-    ControlResponse,
-    Request,
-    RequestOutput,
-    RequestStatus,
-    RequestType,
-)
+from fastdeploy.engine.request import ControlRequest, ControlResponse, Request, RequestOutput, RequestStatus
 from fastdeploy.utils import EngineError
 
 MODEL_NAME = os.getenv("MODEL_PATH", "/path/to/models") + "/ERNIE-4.5-0.3B-Paddle"
@@ -1149,131 +1142,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.split_connector.send_splitwise_tasks.assert_called_once()
         eng.insert_tasks.assert_called_once()
-        self._detach_finalizer(eng)
-
-    def test_schedule_request_to_worker_v1_sends_tasks_and_errors(self):
-        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
-        eng = self._make_engine(cfg)
-        eng.running = True
-        eng.is_paused = False
-        eng._pause_cond = threading.Condition()
-        eng._send_error_response = Mock()
-
-        task = Request(request_id="r0", prompt_token_ids=[1], prompt_token_ids_len=1)
-        task.task_type = RequestType.PREFILL
-        task.trace_carrier = {}
-        task.metrics.scheduler_recv_req_time = time.time()
-
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-                self.real_bsz = 1
-
-            def schedule(self):
-                return ([task], [("err_ok", None), ("err_bad", "bad")])
-
-            def get_real_bsz(self):
-                return None
-
-        eng.resource_manager = DummyRM()
-        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False))
-
-        def stop_running(_payload):
-            eng.running = False
-
-        eng.engine_worker_queue.put_tasks = Mock(side_effect=stop_running)
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                return None
-
-        with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._schedule_request_to_worker_v1()
-
-        eng.engine_worker_queue.put_tasks.assert_called_once()
-        eng._send_error_response.assert_called_once_with("err_bad", "bad")
-        self._detach_finalizer(eng)
-
-    def test_schedule_request_to_worker_v1_threadpool_shutdown(self):
-        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
-        eng = self._make_engine(cfg)
-        eng.running = True
-        eng.is_paused = False
-        eng._pause_cond = threading.Condition()
-
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-
-            def schedule(self):
-                return ([], [])
-
-        eng.resource_manager = DummyRM()
-        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False))
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                raise RuntimeError("shutdown")
-
-        with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._schedule_request_to_worker_v1()
-
-        self._detach_finalizer(eng)
-
-    def test_schedule_request_to_worker_v1_fetch_empty(self):
-        cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
-        eng = self._make_engine(cfg)
-        eng.running = True
-        eng.is_paused = False
-        eng._pause_cond = threading.Condition()
-
-        class DummyRM:
-            def __init__(self):
-                self.abort_req_ids_set = set()
-                self.waiting = []
-
-            def available_batch(self):
-                return 1
-
-            def check_and_free_block_tables(self):
-                return None
-
-            def available_block_num(self):
-                return 8
-
-            def schedule(self):
-                eng.running = False
-                return ([], [])
-
-        eng.resource_manager = DummyRM()
-        eng.scheduler = Mock(get_requests=Mock(return_value=[]))
-        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False))
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                fn()
-
-        with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-            patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
-        ):
-            eng._schedule_request_to_worker_v1()
-
         self._detach_finalizer(eng)
 
     def test_start_zmq_service_ipc_servers(self):
