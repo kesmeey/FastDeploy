@@ -1922,8 +1922,11 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.scheduler = Mock(get_results=get_results)
 
-        with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False):
-            eng._zmq_send_generated_tokens()
+        try:
+            with patch("fastdeploy.engine.common_engine.envs.FD_ENABLE_INTERNAL_ADAPTER", False):
+                eng._zmq_send_generated_tokens()
+        finally:
+            eng.running = False
 
         self._detach_finalizer(eng)
 
