@@ -703,6 +703,7 @@ def test_mtp_sampler_forward_cuda(monkeypatch):
         "output_padding_offset": paddle.zeros([2, 1], dtype="int64"),
         "output_cum_offsets": paddle.zeros([2, 1], dtype="int64"),
         "batch_id_per_token_output": paddle.zeros([2], dtype="int64"),
+        "cu_seqlens_q_output": paddle.zeros([3], dtype="int32"),
     }
     sampling_metadata.share_inputs = share_inputs
 
@@ -809,6 +810,7 @@ def test_mtp_sampler_forward_cuda_raw_logprobs(monkeypatch):
         "output_padding_offset": paddle.zeros([1, 1], dtype="int64"),
         "output_cum_offsets": paddle.zeros([1, 1], dtype="int64"),
         "batch_id_per_token_output": paddle.zeros([1], dtype="int64"),
+        "cu_seqlens_q_output": paddle.zeros([2], dtype="int32"),
     }
     sampling_metadata.share_inputs = share_inputs
 

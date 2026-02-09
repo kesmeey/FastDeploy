@@ -965,19 +965,16 @@ class TestCacheTransferManager(unittest.TestCase):
         self.manager.gpu_cache_v_tensors = [paddle.zeros([1])]
         self.manager.num_cpu_blocks = 0
 
+        def maybe_stop_cleared(*_):
+            if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.CLEARED:
+                raise StopIteration
+
         with (
             patch("fastdeploy.cache_manager.cache_transfer_manager.unset_data_ipc") as mock_unset,
             patch.object(self.manager, "pause"),
             patch("fastdeploy.cache_manager.cache_transfer_manager.set_device"),
             patch("fastdeploy.cache_manager.cache_transfer_manager.envs.FD_ENABLE_SWAP_SPACE_CLEARING", False),
-            patch(
-                "time.sleep",
-                side_effect=lambda *_: (
-                    (_ for _ in ()).throw(StopIteration)
-                    if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.CLEARED
-                    else None
-                ),
-            ),
+            patch("time.sleep", side_effect=maybe_stop_cleared),
         ):
             with self.assertRaises(StopIteration):
                 self.manager.check_cache_status(args)
@@ -1001,6 +998,10 @@ class TestCacheTransferManager(unittest.TestCase):
         self.manager.gpu_cache_v_tensors = [paddle.zeros([1])]
         self.manager.num_cpu_blocks = 0
 
+        def maybe_stop_cleared_with_tensor(*_):
+            if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.CLEARED:
+                raise StopIteration
+
         with (
             patch("fastdeploy.cache_manager.cache_transfer_manager.unset_data_ipc"),
             patch.object(self.manager, "pause"),
@@ -1009,14 +1010,7 @@ class TestCacheTransferManager(unittest.TestCase):
             patch("paddle.device.cuda.empty_cache") as mock_empty,
             patch("paddle.set_device"),
             patch.object(self.manager, "_log_memory"),
-            patch(
-                "time.sleep",
-                side_effect=lambda *_: (
-                    (_ for _ in ()).throw(StopIteration)
-                    if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.CLEARED
-                    else None
-                ),
-            ),
+            patch("time.sleep", side_effect=maybe_stop_cleared_with_tensor),
         ):
             with self.assertRaises(StopIteration):
                 self.manager.check_cache_status(args)
@@ -1088,20 +1082,17 @@ class TestCacheTransferManager(unittest.TestCase):
         self.manager.swap_space_ready_signal = DummySignal(1)
         self.manager.num_cpu_blocks = 0
 
+        def maybe_stop_normal(*_):
+            if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.NORMAL:
+                raise StopIteration
+
         with (
             patch.object(self.manager, "_init_cpu_cache"),
             patch.object(self.manager, "_init_gpu_cache"),
             patch("fastdeploy.cache_manager.cache_transfer_manager.unset_data_ipc"),
             patch.object(self.manager, "resume"),
             patch("fastdeploy.cache_manager.cache_transfer_manager.envs.FD_ENABLE_SWAP_SPACE_CLEARING", False),
-            patch(
-                "time.sleep",
-                side_effect=lambda *_: (
-                    (_ for _ in ()).throw(StopIteration)
-                    if self.manager.kv_cache_status_signal.value[0] == cache_transfer_manager.KVCacheStatus.NORMAL
-                    else None
-                ),
-            ),
+            patch("time.sleep", side_effect=maybe_stop_normal),
         ):
             with self.assertRaises(StopIteration):
                 self.manager.check_cache_status(args)
