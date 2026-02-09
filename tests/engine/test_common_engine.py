@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """
 # Copyright (c) 2025  PaddlePaddle Authors. All Rights Reserved.
 #
@@ -2861,3 +2862,5 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             eng.insert_tasks([request])
         self.assertIn("request id", str(ctx.exception))
         self._detach_finalizer(eng)
+=======
+>>>>>>> 4e6ed0099 (Deleted test_common_engine.py)
