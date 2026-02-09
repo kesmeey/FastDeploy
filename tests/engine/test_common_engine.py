@@ -2241,6 +2241,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
     def test_wait_all_control_responses_timeout(self):
         cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
         eng = self._make_engine(cfg)
+
         class DummyQueue:
             def __init__(self):
                 self.name = "q0"
