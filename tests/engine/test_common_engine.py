@@ -2295,7 +2295,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.insert_tasks(tasks)
 
         eng.scheduler.put_results.assert_called_once()
-        eng.engine_worker_queue.put_tasks.assert_not_called()
+        eng.engine_worker_queue.put_tasks.assert_called_once()
         self._detach_finalizer(eng)
 
     def test_insert_tasks_decode_disaggregate_sets_flags(self):
