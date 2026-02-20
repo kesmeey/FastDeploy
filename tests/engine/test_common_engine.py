@@ -1276,7 +1276,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         try:
             with (
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
             ):
                 eng._schedule_request_to_worker_v1()
         finally:
@@ -1365,7 +1364,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             with (
                 patch("fastdeploy.engine.common_engine.envs.PREFILL_CONTINUOUS_REQUEST_DECODE_RESOURCES", True),
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
             ):
                 eng._schedule_request_to_worker_v1()
         finally:
@@ -1444,7 +1442,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             with (
                 patch("fastdeploy.engine.common_engine.envs.PREFILL_CONTINUOUS_REQUEST_DECODE_RESOURCES", False),
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
             ):
                 eng._schedule_request_to_worker_v1()
         finally:
@@ -1503,7 +1500,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         try:
             with (
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
-                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
             ):
                 eng._schedule_request_to_worker_v1()
         finally:
@@ -1839,7 +1835,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             with (
                 patch("fastdeploy.engine.common_engine.envs.ENABLE_V1_KVCACHE_SCHEDULER", True),
                 patch("fastdeploy.engine.common_engine.threading.Thread", DummyThread),
-                patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
             ):
                 eng._decode_process_splitwise_requests()
         finally:
