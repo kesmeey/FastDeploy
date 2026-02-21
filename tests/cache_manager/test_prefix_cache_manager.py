@@ -257,7 +257,13 @@ def _create_manager(
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         quant_config=quant_config,
     )
-    return PrefixCacheManager(config, tensor_parallel_size=1, splitwise_role=splitwise_role)
+    manager = PrefixCacheManager(config, tensor_parallel_size=1, splitwise_role=splitwise_role)
+    # Newer manager code initializes these IPC attributes in launch_cache_manager,
+    # while many unit tests exercise methods directly on a fresh manager.
+    manager.cache_task_inflight_signal = SimpleNamespace(value=np.zeros([1], dtype=np.int32))
+    manager.prefix_tree_status_signal = SimpleNamespace(value=np.array([PrefixTreeStatus.NORMAL], dtype=np.int32))
+    manager.cache_task_queue = _DummyEngineCacheQueue()
+    return manager
 
 
 def _make_block_node(manager, node_id, input_ids, *, block_size=2, parent=None, cache_status=CacheStatus.GPU):
