@@ -1387,22 +1387,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
         eng._send_error_response = Mock()
 
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-                self.real_bsz = 1
-
-            def available_batch(self):
-                return 1
-
-            def schedule(self):
-                eng.running = False
-                return ([task], [("rid_x", None), ("rid_y", "bad")])
-
-            def get_real_bsz(self):
-                return self.real_bsz
-
-        eng.resource_manager = DummyRM()
+        eng.resource_manager = self._make_v1_decode_rm(eng, ([task], [("rid_x", None), ("rid_y", "bad")]))
 
         try:
             with (
@@ -1437,22 +1422,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.scheduler = Mock(get_requests=Mock(return_value=[]), put_results=Mock())
         eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
 
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-                self.real_bsz = 1
-
-            def available_batch(self):
-                return 1
-
-            def schedule(self):
-                eng.running = False
-                return ([task], [])
-
-            def get_real_bsz(self):
-                return self.real_bsz
-
-        eng.resource_manager = DummyRM()
+        eng.resource_manager = self._make_v1_decode_rm(eng, ([task], []))
 
         try:
             with (
@@ -1486,22 +1456,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
         eng._send_error_response = Mock()
 
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-                self.real_bsz = 1
-
-            def available_batch(self):
-                return 1
-
-            def schedule(self):
-                eng.running = False
-                return ([task], [("rid_none", None)])
-
-            def get_real_bsz(self):
-                return self.real_bsz
-
-        eng.resource_manager = DummyRM()
+        eng.resource_manager = self._make_v1_decode_rm(eng, ([task], [("rid_none", None)]))
 
         with (
             patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", self._make_dummy_executor(eng)),
@@ -1519,15 +1474,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False))
 
-        class DummyRM:
-            def __init__(self):
-                self.waiting = []
-
-            def schedule(self):
-                eng.running = False
-                return ([], [])
-
-        eng.resource_manager = DummyRM()
+        eng.resource_manager = self._make_v1_decode_rm(eng, ([], []))
 
         class DummyExecutor:
             def __init__(self, max_workers=None):
