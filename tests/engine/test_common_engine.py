@@ -438,28 +438,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             )
 
         # Patch EngineWorkerQueue before EngineService ctor to avoid real IPC
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-            def num_tasks(self):
-                return 0
-
-            def num_cache_infos(self):
-                return 0
-
-            def disaggregate_queue_empty(self):
-                return True
-
-            def get_disaggregated_tasks(self):
-                return []
-
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", self._make_full_dummy_q_cls()):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
 
@@ -479,17 +457,10 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng.start_cache_service = fake_start_cache
 
         # Signals: make loaded_model_signal ready immediately; include launched_cache_manager_signal
-        class Sig:
-            def __init__(self, v=0):
-                self.value = np.array([v], dtype=np.int32)
-
-            def clear(self):
-                pass
-
         def fake_init_signals():
-            eng.worker_ready_signal = Sig(0)
-            eng.loaded_model_signal = Sig(1)  # ready -> skip wait loop
-            eng.launched_cache_manager_signal = Sig(0)
+            eng.worker_ready_signal = self._Sig(0)
+            eng.loaded_model_signal = self._Sig(1)  # ready -> skip wait loop
+            eng.launched_cache_manager_signal = self._Sig(0)
 
         eng._init_worker_signals = fake_init_signals
 
@@ -513,28 +484,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         """Cover lines 215-217 and 231 in start()."""
         cfg = self._make_cfg(splitwise_role="mixed", num_gpu_blocks_override=4)
 
-        class DummyQ:
-            def __init__(self, *a, **k):
-                self.available_prefill_instances = type("X", (), {"put": lambda *_: None})()
-
-            def get_server_port(self):
-                return 0
-
-            def cleanup(self):
-                pass
-
-            def num_tasks(self):
-                return 0
-
-            def num_cache_infos(self):
-                return 0
-
-            def disaggregate_queue_empty(self):
-                return True
-
-            def get_disaggregated_tasks(self):
-                return []
-
         with patch("fastdeploy.engine.common_engine.EngineWorkerQueue", self._make_full_dummy_q_cls()):
             eng = EngineService(cfg, start_queue=False, use_async_llm=True)
 
@@ -551,17 +500,10 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.start_cache_service = fake_start_cache
 
-        class Sig:
-            def __init__(self, v=0):
-                self.value = np.array([v], dtype=np.int32)
-
-            def clear(self):
-                pass
-
         def fake_init_signals():
-            eng.worker_ready_signal = Sig(0)
-            eng.loaded_model_signal = Sig(1)
-            eng.launched_cache_manager_signal = Sig(0)
+            eng.worker_ready_signal = self._Sig(0)
+            eng.loaded_model_signal = self._Sig(1)
+            eng.launched_cache_manager_signal = self._Sig(0)
 
         eng._init_worker_signals = fake_init_signals
 
@@ -1196,11 +1138,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         eng = self._make_engine(cfg)
         eng.running = True
 
-        class Sig:
-            def __init__(self, v=0):
-                self.value = np.array([v], dtype=np.int32)
-
-        eng.exist_prefill_task_signal = Sig(0)
+        eng.exist_prefill_task_signal = self._Sig(0)
         eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), num_cache_infos=Mock(return_value=0))
 
         class DummyRM:
@@ -1283,16 +1221,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.resource_manager = DummyRM()
 
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
-
         try:
             with (
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", self._make_dummy_executor(eng)),
@@ -1356,16 +1284,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             send_cache_info_to_messager=Mock(),
         )
 
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
-
         try:
             with (
                 patch("fastdeploy.engine.common_engine.envs.PREFILL_CONTINUOUS_REQUEST_DECODE_RESOURCES", False),
@@ -1415,16 +1333,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 return self.real_bsz
 
         eng.resource_manager = DummyRM()
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
 
         try:
             with (
@@ -1476,16 +1384,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.resource_manager = DummyRM()
 
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
-
         try:
             with (
                 patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", self._make_dummy_executor(eng)),
@@ -1535,16 +1433,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
 
         eng.resource_manager = DummyRM()
 
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
-
         with (
             patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", self._make_dummy_executor(eng)),
             patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
@@ -1579,7 +1467,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
                 raise RuntimeError("cannot schedule new futures after shutdown")
 
         with (
-            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", self._make_dummy_executor(eng)),
+            patch("fastdeploy.engine.common_engine.ThreadPoolExecutor", DummyExecutor),
             patch("fastdeploy.engine.common_engine.time.sleep", lambda *_: None),
         ):
             eng._schedule_request_to_worker_v1()
@@ -1650,16 +1538,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             check_decode_allocated=Mock(return_value=(True, "")),
             send_cache_info_to_messager=Mock(),
         )
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
 
         with (
             patch("fastdeploy.engine.common_engine.envs.PREFILL_CONTINUOUS_REQUEST_DECODE_RESOURCES", True),
@@ -1738,16 +1616,6 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
             check_decode_allocated=Mock(return_value=(True, "")),
             send_cache_info_to_messager=Mock(),
         )
-
-        class DummyExecutor:
-            def __init__(self, max_workers=None):
-                pass
-
-            def submit(self, fn):
-                try:
-                    fn()
-                finally:
-                    eng.running = False
 
         with (
             patch("fastdeploy.engine.common_engine.envs.PREFILL_CONTINUOUS_REQUEST_DECODE_RESOURCES", True),
