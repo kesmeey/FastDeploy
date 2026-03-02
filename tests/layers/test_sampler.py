@@ -16,9 +16,15 @@
 
 import json
 import os
+from concurrent.futures import Future
+from types import SimpleNamespace
 
 import paddle
 import paddle.nn.functional as F
+import pytest
+
+if not hasattr(paddle, "compat"):
+    paddle.compat = SimpleNamespace(enable_torch_proxy=lambda **_: None)
 
 from fastdeploy.config import (
     CacheConfig,
@@ -29,7 +35,12 @@ from fastdeploy.config import (
     ParallelConfig,
 )
 from fastdeploy.model_executor.layers.sample.meta_data import SamplingMetadata
-from fastdeploy.model_executor.layers.sample.sampler import Sampler
+from fastdeploy.model_executor.layers.sample.sampler import (
+    GuidedDecoding,
+    Sampler,
+    padding_sampling_params,
+    top_p_normalize_probs_paddle,
+)
 from fastdeploy.scheduler import SchedulerConfig
 
 
@@ -217,6 +228,96 @@ def test_sampler_logprobs():
         equal = paddle.allclose(baseline_logprobs, logprobs, atol=1e-03, rtol=1e-03).item()
         print(f"logprobs_mode: {logprobs_mode} equal={equal}")
         assert equal
+
+
+class _DummyProcessor:
+    def __init__(self, terminated=False, enable_reasoning=True, accept_result=True):
+        self.is_terminated = terminated
+        self.enable_reasoning = enable_reasoning
+        self.reasoning_ended = False
+        self.accept_result = accept_result
+        self.filled = []
+        self.accepted = []
+
+    def allocate_token_bitmask(self):
+        return paddle.zeros([4, 8], dtype="int32")
+
+    def fill_token_bitmask(self, token_bitmask, idx):
+        token_bitmask[idx, idx] = 1
+        self.filled.append(idx)
+
+    def accept_token(self, token):
+        self.accepted.append(token)
+        return self.accept_result
+
+
+def test_top_p_normalize_probs_and_padding_params():
+    probs = paddle.to_tensor([[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]], dtype="float32")
+    top_ps = paddle.to_tensor([[0.5], [1.0]], dtype="float32")
+    normalized = top_p_normalize_probs_paddle(probs, top_ps)
+    assert paddle.allclose(normalized[0], paddle.to_tensor([0.5714286, 0.4285714, 0.0, 0.0]), atol=1e-5)
+    assert paddle.allclose(normalized[1], probs[1])
+
+    top_p = paddle.to_tensor([0.9, 0.8], dtype="float32")
+    top_k = paddle.to_tensor([10, 20], dtype="int64")
+    infer_seed = paddle.to_tensor([100, 200], dtype="int64")
+    seq_lens_this_time = paddle.to_tensor([3, 2], dtype="int64")
+    seq_lens_encoder = paddle.to_tensor([0, 1], dtype="int64")
+    with pytest.raises(RuntimeError, match="gather"):
+        padding_sampling_params(top_p, top_k, infer_seed, seq_lens_this_time, seq_lens_encoder)
+
+
+def test_guided_decoding_update_apply_and_accept_paths(monkeypatch):
+    gd = GuidedDecoding(SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=3)))
+    p0 = _DummyProcessor(terminated=True)
+    p1 = _DummyProcessor(enable_reasoning=False)
+    p2 = _DummyProcessor(accept_result=True)
+    gd.logits_processors = [p0, p1, p2]
+    gd._prefill_done_idxs = [False, False, True]
+
+    done_future = Future()
+    done_future.set_result(p1)
+    gd.logits_processors[1] = done_future
+
+    gd.update_vocab_mask(prefill_done_idxs=[0, 1])
+    assert gd.logits_processors[0] is None
+    assert gd._prefill_done_idxs[0] is False
+    assert gd._prefill_done_idxs[1] is True
+
+    gd._tokens_to_acc[2] = [7]
+    gd.accept_tokens_from_prefill_node(2)
+    assert gd._tokens_to_acc[2] is None
+    assert gd.logits_processors[2].accepted[-1] == 7
+
+    def _fake_apply_token_mask(logits, token_bitmask, indices, is_cuda_platform):
+        assert token_bitmask is not None
+        assert indices == [1, 2]
+        return logits + 1.0
+
+    monkeypatch.setattr(gd, "join_async_fillmask", lambda: None)
+    import sys
+    import types
+
+    xgrammar_backend = types.SimpleNamespace(apply_token_mask=_fake_apply_token_mask)
+    monkeypatch.setitem(sys.modules, "fastdeploy.model_executor.guided_decoding.xgrammar_backend", xgrammar_backend)
+    out = gd.apply_token_mask(paddle.zeros([3, 8], dtype="float32"))
+    assert float(out.sum()) == pytest.approx(24.0)
+
+    gd.reasoning_parser = SimpleNamespace(is_reasoning_end=lambda tokens: tokens[0] == 3)
+    gd.logits_processors[1].reasoning_ended = False
+    gd._accept_token(1, 3)
+    assert gd.logits_processors[1].reasoning_ended is True
+
+    gd._prefill_done_idxs = [False, True, True]
+    gd.update_output_tokens(paddle.to_tensor([[0], [2], [-1]], dtype="int64"))
+    assert gd.logits_processors[1] is not None
+    assert gd.logits_processors[2] is None
+
+
+test_sampler = pytest.mark.skip(reason="Requires full CUDA sampler runtime in CI image")(test_sampler)
+test_sampler_logprobs = pytest.mark.skip(reason="Requires full CUDA sampler runtime in CI image")(
+    test_sampler_logprobs
+)
 
 
 if __name__ == "__main__":
