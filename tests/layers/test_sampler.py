@@ -16,6 +16,7 @@
 
 import json
 import os
+from pathlib import Path
 import sys
 import types
 from concurrent.futures import Future
@@ -27,14 +28,22 @@ import pytest
 if not hasattr(paddle, "compat"):
     paddle.compat = types.SimpleNamespace(enable_torch_proxy=lambda *args, **kwargs: None)
 
-from fastdeploy.config import (
-    CacheConfig,
-    FDConfig,
-    GraphOptimizationConfig,
-    LoadConfig,
-    ModelConfig,
-    ParallelConfig,
-)
+
+if "triton" not in sys.modules:
+    triton_stub = types.ModuleType("triton")
+    triton_stub.jit = lambda fn: fn
+    triton_lang_stub = types.ModuleType("triton.language")
+    triton_lang_stub.constexpr = int
+    sys.modules["triton"] = triton_stub
+    sys.modules["triton.language"] = triton_lang_stub
+
+# Avoid importing fastdeploy/__init__.py during unit tests. The package __init__
+# pulls in optional runtime dependencies that are not required by sampler tests.
+if "fastdeploy" not in sys.modules:
+    fastdeploy_pkg = types.ModuleType("fastdeploy")
+    fastdeploy_pkg.__path__ = [str(Path(__file__).resolve().parents[2] / "fastdeploy")]
+    sys.modules["fastdeploy"] = fastdeploy_pkg
+
 from fastdeploy.model_executor.layers.sample.meta_data import SamplingMetadata
 from fastdeploy.model_executor.layers.sample.sampler import (
     GuidedDecoding,
@@ -44,7 +53,6 @@ from fastdeploy.model_executor.layers.sample.sampler import (
     padding_sampling_params,
     top_p_normalize_probs_paddle,
 )
-from fastdeploy.scheduler import SchedulerConfig
 
 
 def _create_fake_logits(batch_size: int, vocab_size: int) -> paddle.Tensor:
@@ -91,53 +99,6 @@ def _create_default_sampling_metadata(
     if max_num_logprobs is not None:
         fake_sampling_metadata.max_num_logprobs = max_num_logprobs
     return fake_sampling_metadata
-
-
-def build_config_json() -> str:
-    config_dict = {
-        "architectures": ["Qwen3MoeForCausalLM"],
-        "hidden_size": 7168,
-        "moe_intermediate_size": 1,
-        "moe_num_experts": 1,
-        "moe_k": 1,
-        "hidden_act": "silu",
-        "num_attention_heads": 64,
-        "dtype": "bfloat16",
-    }
-
-    tmp_dir = f"./tmpefef{paddle.distributed.get_rank()}"
-    os.makedirs(tmp_dir, exist_ok=True)
-    with open(f"./{tmp_dir}/config.json", "w") as f:
-        json.dump(config_dict, f)
-    model_name_or_path = os.path.join(os.getcwd(), tmp_dir)
-    print("model_name_or_path", model_name_or_path)
-    return model_name_or_path
-
-
-def get_fd_config(batch_size: int):
-    fd_config = FDConfig(
-        model_config=ModelConfig(
-            {
-                "model": build_config_json(),
-                "max_model_len": 2048,
-            }
-        ),
-        parallel_config=ParallelConfig(
-            {
-                "tensor_parallel_size": 1,
-                "expert_parallel_size": 1,
-                "expert_parallel_rank": 0,
-                "data_parallel_size": 1,
-            }
-        ),
-        # quant_config=BlockWiseFP8Config(weight_block_size=[128, 128]),
-        scheduler_config=SchedulerConfig({"max_num_seqs": batch_size}),
-        cache_config=CacheConfig({}),
-        graph_opt_config=GraphOptimizationConfig({}),
-        load_config=LoadConfig({}),
-        ips="0.0.0.0",
-    )
-    return fd_config
 
 
 class FakeLogitsProcessor:
@@ -477,7 +438,7 @@ def test_sampler_forward_cuda(monkeypatch):
     sampling_metadata.logits_processors = []
 
     def _apply_penalty(*args, **kwargs):
-        return args[3] + 0.5
+        return args[1] + 0.5
 
     def _min_p_sampling(probs, min_p, min_p_list):
         return probs
@@ -506,7 +467,7 @@ def test_sampler_forward_cuda_raw_and_processed_logits(monkeypatch):
     sampling_metadata.logits_processors = [_Proc()]
 
     def _apply_penalty(*args, **kwargs):
-        return args[3]
+        return args[1]
 
     def _min_p_sampling(probs, min_p, min_p_list):
         return probs
@@ -654,7 +615,7 @@ def test_speculative_sampler_forward_xpu(monkeypatch):
     monkeypatch.setattr(paddle, "where", _safe_where)
 
     def _apply_speculative_penalty(*args, **kwargs):
-        return args[1]
+        return args[2]
 
     def _top_k_top_p_sampling(probs, top_p, top_k, topp_seed):
         return None, paddle.to_tensor([[0]], dtype="int64")
@@ -705,7 +666,7 @@ def test_mtp_sampler_forward_cuda(monkeypatch):
     sampling_metadata.share_inputs = share_inputs
 
     def _apply_speculative_penalty(*args, **kwargs):
-        return args[1]
+        return args[2]
 
     def _speculate_insert_first_token(token_ids, accept_tokens, next_tokens, *args, **kwargs):
         token_ids[:] = next_tokens.flatten()
@@ -742,7 +703,7 @@ def test_mtp_sampler_forward_xpu(monkeypatch):
     sampling_metadata.share_inputs = share_inputs
 
     def _apply_speculative_penalty(*args, **kwargs):
-        return args[1]
+        return args[2]
 
     def _top_k_top_p_sampling(probs, top_p, top_k, top_k_list):
         return None, paddle.to_tensor([[1]], dtype="int64")
@@ -812,7 +773,7 @@ def test_mtp_sampler_forward_cuda_raw_logprobs(monkeypatch):
     sampling_metadata.share_inputs = share_inputs
 
     def _apply_speculative_penalty(*args, **kwargs):
-        return args[1]
+        return args[2]
 
     def _speculate_insert_first_token(token_ids, accept_tokens, next_tokens, *args, **kwargs):
         token_ids[:] = next_tokens.flatten()
