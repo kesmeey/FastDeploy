@@ -54,6 +54,9 @@ from fastdeploy.model_executor.layers.sample.sampler import (
     top_p_normalize_probs_paddle,
 )
 
+@pytest.fixture(autouse=True)
+def _disable_triton_cuda_path(monkeypatch):
+    monkeypatch.setattr("fastdeploy.model_executor.layers.sample.logprobs.current_platform.is_cuda", lambda: False)
 
 def _create_fake_logits(batch_size: int, vocab_size: int) -> paddle.Tensor:
     fake_logits = paddle.rand(shape=[batch_size, vocab_size], dtype="float32")
